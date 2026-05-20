@@ -1,0 +1,107 @@
+# Trades — shared infrastructure compose (DEVELOPMENT).
+#
+# Lives in the trades-infra repo (version-controlled). Started by
+# `cd ai-standards && make infra-up`, which resolves this file via
+# INFRA_DIR=../trades-infra declared in trades-docs/workspace.mk. Per-service
+# compose files (e.g. identity-service/docker-compose.yml) join the
+# `workspace-network` declared below as an external network.
+#
+# Versions match ai-standards/standards/tech-stack.md (Postgres 18, RabbitMQ 4).
+# Production infrastructure is NOT this file — see deploy/README.md.
+
+# `name:` pins the compose project name. It was `workspacetrades` while this
+# file lived at the workspace root (derived from the directory name); pinning it
+# here keeps the existing volumes (workspacetrades_postgres_data /
+# workspacetrades_clamav_db) and running containers attached after the move.
+# Do NOT change it or Postgres/ClamAV data will appear empty on the next up.
+name: workspacetrades
+
+services:
+  postgres:
+    image: postgis/postgis:18-3.6
+    # postgis/postgis:18-* is amd64-only on Docker Hub; Apple Silicon hosts
+    # need explicit platform pin so Docker Desktop runs it under Rosetta/QEMU
+    # emulation. Linux/amd64 hosts ignore the pin (it matches native).
+    platform: linux/amd64
+    container_name: trades-postgres
+    environment:
+      # Single Postgres instance hosts one database PER service. Each service
+      # creates its own database via the init script below — services never share.
+      POSTGRES_USER: workspace
+      POSTGRES_PASSWORD: workspace
+      POSTGRES_DB: workspace
+    ports:
+      - "5432:5432"
+    volumes:
+      # Postgres 18 expects the mount at /var/lib/postgresql (NOT /data) so the
+      # versioned subdirectory layout works — see the upstream image notice.
+      - postgres_data:/var/lib/postgresql
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - workspace-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workspace"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: trades-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+    networks:
+      - workspace-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: trades-mailpit
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # Web UI
+    networks:
+      - workspace-network
+
+  clamav:
+    # Antivirus daemon consumed by media-service's scan worker (Slice 6.2).
+    # Pinned to 1.5.2-debian13-slim per SC-005 + AD-11 — :stable would track a
+    # moving target and a future signature-DB format change could silently
+    # break operator dashboards on freshclam warnings. The -debian13-slim
+    # variant is multi-arch (amd64 + arm64 + ppc64le) so Apple Silicon hosts
+    # run it natively; the bare `1.5.2` tag is Alpine-amd64-only.
+    image: clamav/clamav:1.5.2-debian13-slim
+    container_name: trades-clamav
+    restart: unless-stopped
+    ports:
+      # Loopback only — clamd has no authentication by default and must not
+      # be reachable from the host LAN. The compose network gives the worker
+      # in-cluster access via the `clamav` service name on workspace-network.
+      - "127.0.0.1:3310:3310"
+    volumes:
+      - clamav_db:/var/lib/clamav   # persists signature DB across restarts
+    networks:
+      - workspace-network
+    healthcheck:
+      test: ["CMD", "clamdscan", "--ping", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s   # long warm-up: freshclam pulls the initial signature DB
+
+volumes:
+  postgres_data:
+  clamav_db:
+
+networks:
+  workspace-network:
+    name: workspace-network
+    driver: bridge
