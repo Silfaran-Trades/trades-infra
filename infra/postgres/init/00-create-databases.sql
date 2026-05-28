@@ -8,3 +8,4 @@ CREATE DATABASE catalog;
 CREATE DATABASE media;
 CREATE DATABASE profile_service;
 CREATE DATABASE profile_service_test;
+CREATE DATABASE demand;
