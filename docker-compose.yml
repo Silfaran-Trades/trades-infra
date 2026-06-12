@@ -18,11 +18,13 @@ name: workspacetrades
 
 services:
   postgres:
-    image: postgis/postgis:18-3.6
-    # postgis/postgis:18-* is amd64-only on Docker Hub; Apple Silicon hosts
-    # need explicit platform pin so Docker Desktop runs it under Rosetta/QEMU
-    # emulation. Linux/amd64 hosts ignore the pin (it matches native).
-    platform: linux/amd64
+    # imresamu/postgis is the multi-arch (amd64 + arm64) build of the SAME
+    # upstream PostGIS Dockerfiles, maintained by a PostGIS contributor. The
+    # official postgis/postgis:18-* is amd64-only, which forced Rosetta/QEMU
+    # emulation on Apple Silicon (slow). This variant runs natively on both
+    # arches, so no platform pin is needed. Same PG 18 + PostGIS 3.6 → the
+    # existing postgres_data volume is compatible (no re-init).
+    image: imresamu/postgis:18-3.6
     container_name: trades-postgres
     environment:
       # Single Postgres instance hosts one database PER service. Each service
