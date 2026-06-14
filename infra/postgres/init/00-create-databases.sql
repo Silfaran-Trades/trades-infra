@@ -9,3 +9,5 @@ CREATE DATABASE media;
 CREATE DATABASE profile_service;
 CREATE DATABASE profile_service_test;
 CREATE DATABASE demand;
+CREATE DATABASE chat;
+CREATE DATABASE chat_test;
