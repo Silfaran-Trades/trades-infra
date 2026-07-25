@@ -11,3 +11,12 @@ CREATE DATABASE profile_service_test;
 CREATE DATABASE demand;
 CREATE DATABASE chat;
 CREATE DATABASE chat_test;
+
+-- Modular-monolith app database (ADR-076). ONE database for the whole backend;
+-- each bundle owns a SCHEMA inside it (identity.*, company.*, ...), created by the
+-- app's own Phinx migrations — never here.
+--
+-- The per-service databases above are the microservices era and stay until
+-- migration Wave 8 retires them (the rollback path depends on them surviving).
+CREATE DATABASE trades_app;
+CREATE DATABASE trades_app_test;
