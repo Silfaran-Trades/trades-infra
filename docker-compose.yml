@@ -6,7 +6,7 @@
 # compose files (e.g. identity-service/docker-compose.yml) join the
 # `workspace-network` declared below as an external network.
 #
-# Versions match ai-standards/standards/tech-stack.md (Postgres 18, RabbitMQ 4).
+# Versions match ai-standards/standards/tech-stack.md (Postgres 18).
 # Production infrastructure is NOT this file — see deploy/README.md.
 
 # `name:` pins the compose project name. It was `workspacetrades` while this
@@ -47,22 +47,23 @@ services:
       timeout: 5s
       retries: 10
 
-  rabbitmq:
-    image: rabbitmq:4-management
-    container_name: trades-rabbitmq
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
-    ports:
-      - "5672:5672"   # AMQP
-      - "15672:15672" # Management UI
-    networks:
-      - workspace-network
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+  # `rabbitmq` lived here until the modular-monolith migration completed (ADR-076, Wave 8).
+  #
+  # It carried cross-SERVICE messaging for eight services. Seven of them are bundles inside
+  # `trades-backend` now — their edges are in-process or `doctrine://` — and the eighth,
+  # media-service, only ever used the broker as a loopback to itself, so its two internal
+  # queues moved to `doctrine://` against its own database. `doctrine://` is also a durable
+  # queue and also needs a running `messenger:consume` worker; what disappeared is the
+  # BROKER, not the workers.
+  #
+  # Removing it here does NOT delete the queues, exchanges or bindings on a broker that has
+  # already run — `symfony/amqp-messenger` has no `unbind` call, so every binding this
+  # workspace ever created survives its config. Deleting the container and its volume is the
+  # operational half, and on a dev host that is the whole of it.
+  #
+  # Bringing it back is this block plus `symfony/amqp-messenger`, an `ext-amqp` build stage
+  # and a DSN. The three graduation triggers that would justify it are in
+  # `../red-profesionales-monolith-migration-plan.md` § 4.2.
 
   mailpit:
     image: axllent/mailpit:latest
