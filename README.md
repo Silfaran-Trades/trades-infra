@@ -8,15 +8,17 @@ following the `ai-standards` infra-repo convention (see
 
 - `docker-compose.yml` — shared **development** infrastructure that every service
   joins via the external `workspace-network`:
-  - `postgis/postgis:18-3.6` (`trades-postgres`) — one database per service
-  - `rabbitmq:4-management` (`trades-rabbitmq`) — Symfony Messenger transport
+  - `imresamu/postgis:18-3.6` (`trades-postgres`) — `trades_app` for the modular-monolith
+    backend (one schema per bundle) plus `media` for media-service
   - `axllent/mailpit` (`trades-mailpit`) — dev SMTP capture
   - `clamav/clamav:1.5.2-debian13-slim` (`trades-clamav`) — media-service scan worker
   Image versions track `ai-standards/standards/tech-stack.md`. Owned/maintained by
   the DevOps agent.
-- `infra/postgres/init/00-create-databases.sql` — one `CREATE DATABASE` per service.
-  Add a line here when scaffolding a new service that needs Postgres (runs only on
-  first container startup, while the data volume is empty).
+- `infra/postgres/init/00-create-databases.sql` — `trades_app` (+ its test database) for the
+  modular-monolith backend, and `media` (+ `media_test`) for media-service. A new bounded
+  context is a new **bundle** with a **schema** inside `trades_app`, created by the app's own
+  migrations — do NOT add a line here for it (ADR-076). Runs only on first container startup,
+  while the data volume is empty, so editing it never changes an existing cluster.
 - `deploy/` — **production** infrastructure as code. A different artifact from the
   dev compose above — see [`deploy/README.md`](deploy/README.md).
 
