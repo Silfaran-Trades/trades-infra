@@ -62,8 +62,9 @@ services:
   # operational half, and on a dev host that is the whole of it.
   #
   # Bringing it back is this block plus `symfony/amqp-messenger`, an `ext-amqp` build stage
-  # and a DSN. The three graduation triggers that would justify it are in
-  # `../red-profesionales-monolith-migration-plan.md` § 4.2.
+  # and a DSN. The three graduation triggers that would once have justified it were recorded
+  # only in the unversioned migration plan, which no longer exists — so it now needs a fresh
+  # ADR in `../trades-docs/decisions.md`, not a citation.
 
   mailpit:
     image: axllent/mailpit:latest
