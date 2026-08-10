@@ -13,8 +13,9 @@ Production infrastructure as code lives here. For Trades that means, at minimum:
 - **No message broker.** Wave 8 of the monolith migration removed RabbitMQ from every repo:
   cross-bundle messaging is in-process and deferred work is `doctrine://` against the app's
   own database. Provisioning a managed broker cluster here would be paying for infrastructure
-  nothing connects to. The three triggers that would justify bringing one back are in
-  `red-profesionales-monolith-migration-plan.md` § 4.2.
+  nothing connects to. The three triggers that would once have justified bringing one back were
+  recorded only in the unversioned migration plan, which no longer exists — so it now needs a
+  fresh ADR in `../trades-docs/decisions.md`.
 - **ClamAV** — its own deployment/sidecar for the media-service scan worker.
 - **SMTP** — a real provider (SES / SendGrid / …) replacing Mailpit.
 - **Object storage / CDN** — for media-service uploads (private vs public buckets).
