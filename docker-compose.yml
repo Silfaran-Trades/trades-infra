@@ -26,6 +26,12 @@ services:
     # existing postgres_data volume is compatible (no re-init).
     image: imresamu/postgis:18-3.6
     container_name: trades-postgres
+    # Every service in the workspace depends on this container AND uses it as the
+    # `doctrine://` Messenger transport, so it must come back with the Docker daemon
+    # exactly like its dependents do. Without this, a `docker desktop restart` returns
+    # the ten `unless-stopped` containers and leaves them crash-looping on
+    # `could not translate host name "trades-postgres"` until someone runs `make infra-up`.
+    restart: unless-stopped
     environment:
       # Single Postgres instance hosts one database PER service. Each service
       # creates its own database via the init script below — services never share.
@@ -33,7 +39,12 @@ services:
       POSTGRES_PASSWORD: workspace
       POSTGRES_DB: workspace
     ports:
-      - "5432:5432"
+      # Loopback only — same reasoning as clamav below. The credentials here are
+      # `workspace`/`workspace` and `pg_hba` ends in `host all all all scram-sha-256`,
+      # so a `0.0.0.0` bind puts every service database on the developer's LAN. The
+      # compose network gives every service in-cluster access by the `postgres` service
+      # name. To reach it from another device deliberately, change this one line.
+      - "127.0.0.1:5432:5432"
     volumes:
       # Postgres 18 expects the mount at /var/lib/postgresql (NOT /data) so the
       # versioned subdirectory layout works — see the upstream image notice.
@@ -69,9 +80,14 @@ services:
   mailpit:
     image: axllent/mailpit:latest
     container_name: trades-mailpit
+    # Same reason as postgres above: services send through it, so it returns with them.
+    restart: unless-stopped
     ports:
-      - "1025:1025" # SMTP
-      - "8025:8025" # Web UI
+      # Loopback only — the web UI and its `/api/v1/messages` endpoint are
+      # UNAUTHENTICATED, and every password-reset and email-verification link in the
+      # workspace lands in this inbox.
+      - "127.0.0.1:1025:1025" # SMTP
+      - "127.0.0.1:8025:8025" # Web UI
     networks:
       - workspace-network
 
