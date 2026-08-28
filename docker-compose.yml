@@ -43,8 +43,13 @@ services:
       # `workspace`/`workspace` and `pg_hba` ends in `host all all all scram-sha-256`,
       # so a `0.0.0.0` bind puts every service database on the developer's LAN. The
       # compose network gives every service in-cluster access by the `postgres` service
-      # name. To reach it from another device deliberately, change this one line.
+      # name. To reach it from another device deliberately, change these lines.
+      #
+      # Both loopback families are bound on purpose: `localhost` resolves to ::1 first on
+      # macOS, and leaving the v6 address free lets an unrelated local process answer on it
+      # instead — the IPv6 clash that already forced the SPA off port 5173.
       - "127.0.0.1:5432:5432"
+      - "[::1]:5432:5432"
     volumes:
       # Postgres 18 expects the mount at /var/lib/postgresql (NOT /data) so the
       # versioned subdirectory layout works — see the upstream image notice.
@@ -87,7 +92,9 @@ services:
       # UNAUTHENTICATED, and every password-reset and email-verification link in the
       # workspace lands in this inbox.
       - "127.0.0.1:1025:1025" # SMTP
+      - "[::1]:1025:1025"
       - "127.0.0.1:8025:8025" # Web UI
+      - "[::1]:8025:8025"
     networks:
       - workspace-network
 
@@ -106,6 +113,7 @@ services:
       # be reachable from the host LAN. The compose network gives the worker
       # in-cluster access via the `clamav` service name on workspace-network.
       - "127.0.0.1:3310:3310"
+      - "[::1]:3310:3310"
     volumes:
       - clamav_db:/var/lib/clamav   # persists signature DB across restarts
     networks:
