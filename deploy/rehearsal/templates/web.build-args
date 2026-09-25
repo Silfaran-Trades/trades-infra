@@ -1,0 +1,18 @@
+# Build arguments for the rehearsal's trades-front image (BR-11: every VITE_* is a build
+# argument, the build fails when one is empty; BR-12: the CSP hash is a property of THIS
+# build, so the rehearsal image is a rehearsal variant — `trades.test` origins — never the
+# production artefact). `@DOMAIN@` and `@PORT@` are substituted by rehearse.sh.
+# A VITE_* value is never a secret (invariants.md); the Firebase and Stripe values below are
+# placeholders shaped like the real ones so the build-env assertion passes.
+VITE_API_URL=https://api.@DOMAIN@@PORT@/api
+VITE_MEDIA_API_URL=https://media.@DOMAIN@@PORT@/api
+VITE_MERCURE_HUB_URL=https://api.@DOMAIN@@PORT@/.well-known/mercure
+VITE_SITE_URL=https://app.@DOMAIN@@PORT@
+VITE_PARTNER_CONTACT_EMAIL=rehearsal@@DOMAIN@
+VITE_FIREBASE_API_KEY=rehearsal-firebase-api-key
+VITE_FIREBASE_AUTH_DOMAIN=trades-rehearsal.firebaseapp.com
+VITE_FIREBASE_PROJECT_ID=trades-rehearsal
+VITE_FIREBASE_MESSAGING_SENDER_ID=000000000000
+VITE_FIREBASE_APP_ID=1:000000000000:web:rehearsal
+VITE_FIREBASE_VAPID_KEY=rehearsal-vapid-key
+VITE_STRIPE_PUBLISHABLE_KEY=pk_test_rehearsal

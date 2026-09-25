@@ -1,0 +1,165 @@
+# Trades — the perimeter (Caddy 2.11): TLS termination, one hostname per deployable (BR-28),
+# safe-by-construction request logs (BR-13, LO-009, GD-005), NO application security headers.
+# Derived from ai-standards/templates/deploy/Caddyfile.template — the (log-redaction) and
+# (access-log) snippets are the template's, verbatim. Perimeter decisions: ADR-120.
+#
+# ENV PLACEHOLDERS (substituted at parse time from docker-compose.prod.yml `environment:`):
+#   {$DOMAIN}         the production domain (10.6's decision) — `trades.test` in the rehearsal
+#   {$CADDY_TLS_ARG}  `tls` argument: an ACME email in production, `internal` in the
+#                     rehearsal (Caddy's local CA; the harness trusts its root explicitly —
+#                     verification is never switched off, invariants.md)
+#
+# HOSTS:
+#   app.{$DOMAIN}      → web:8080       the SPA (its nginx emits CSP/HSTS/COOP/CORP itself)
+#   api.{$DOMAIN}      → app:8000       trades-backend; /.well-known/mercure* → mercure:80
+#   media.{$DOMAIN}    → media:8008     media-service
+#   storage.{$DOMAIN}  → storage:9000   the object store's public endpoint (presigned URLs,
+#                                        public media) — the ONE host whose security headers
+#                                        this file sets, because the store cannot (BR-32)
+#
+# RULES THIS FILE MUST KEEP:
+#   - NO security headers on app./api./media. — CSP/HSTS/COOP/CORP are application-emitted
+#     (AS-001..AS-004, BR-15a); a header set in two places drifts in two places. Only the
+#     storage host block carries a `header` directive, and each header still has exactly one
+#     writer per host.
+#   - Every site block imports (access-log): Caddy logs NOTHING about requests without an
+#     explicit `log` directive.
+#   - The redaction filter is imported TWICE — into the global default logger (which carries
+#     the http.log.error.* channel a 502 writes with the full request line) and into every
+#     access log. Importing it in one place only is the failure the template's comment
+#     describes.
+#   - Caddy trusts no upstream proxy here, so a caller's forged X-Forwarded-For is overwritten
+#     with the real address before the backends see it (AC-22); the backends in turn trust
+#     only this proxy's subnet (BR-30).
+#
+# VERIFY BY READING AN EMITTED LINE, never by `caddy validate` (the lexer trap below).
+
+# ---- the redaction filter, applied to BOTH request-logging channels ---------
+(log-redaction) {
+	format filter {
+		wrap json
+		fields {
+			# Strip the query string, KEEP the path.
+			#
+			# ⚠ THE LEXER TRAP — use the character class `[?]`, never the
+			# backslash escape `"\\?"`. The Caddyfile lexer re-processes
+			# `"\\?"` into the regex `\\?` = "an OPTIONAL literal
+			# backslash", which matches the empty string at offset 0, so
+			# `.*$` then eats the ENTIRE uri INCLUDING THE PATH. Verified
+			# on the pinned version: `caddy validate` still prints "Valid
+			# configuration" and the emitted line is `"uri": ""`. It fails
+			# OPEN, silently. Prove this field by reading an emitted log
+			# line, never by the validator's verdict.
+			request>uri regexp "[?].*$" ""
+
+			# ALL headers, all bodies, the TLS block, the source port.
+			# Caddy cannot express a header allowlist (`rename` moves a header
+			# WITHIN request>headers, so deleting the parent map takes the renamed
+			# copy with it) — blanket delete is the deny-by-construction choice here.
+			request>headers delete
+			resp_headers delete
+			request>tls delete
+			request>remote_port delete
+
+			# The caller's IP, PSEUDONYMISED AT WRITE TIME (GD-005): /24 · /48 on
+			# BOTH fields Caddy emits (remote_ip AND client_ip). Anything the mask
+			# cannot parse is written as `-`, never raw.
+			request>remote_ip ip_mask {
+				ipv4 24
+				ipv6 48
+			}
+			request>client_ip ip_mask {
+				ipv4 24
+				ipv6 48
+			}
+		}
+	}
+}
+
+{
+	# The DEFAULT logger — Caddy's operational output AND the http.log.error.*
+	# channel. Output stays stderr (operational lines must reach `docker logs`);
+	# only the FORMAT is filtered, so a 502's request line is redacted before it
+	# is ever written.
+	log {
+		import log-redaction
+	}
+}
+
+# ---- request logging, imported by EVERY site block below (LO-009) -----------
+#
+# A FILE ON THE caddy-logs NAMED VOLUME, not stdout: a recreate (every promotion) destroys
+# the container's log; the file outlives it (DE-007). BOTH a size and a TIME ceiling:
+# `roll_interval 24h` forces a roll on a quiet site so `roll_keep_for 336h` (14 days) is a
+# real ceiling — it MUST match the perimeter-request-log row in pii-inventory.md (BR-21).
+(access-log) {
+	log {
+		# Every site block shares THIS ONE writer (Caddy dedupes file writers by
+		# filename): keep the roll options in this snippet only.
+		output file /var/log/caddy/access.log {
+			roll_size 20MiB
+			roll_keep 14
+			roll_keep_for 336h
+			roll_interval 24h
+		}
+		import log-redaction
+	}
+}
+
+# ---- the SPA ----------------------------------------------------------------
+app.{$DOMAIN} {
+	tls {$CADDY_TLS_ARG}
+	encode zstd gzip
+	import access-log
+	reverse_proxy web:8080
+}
+
+# ---- the backend + the Mercure hub on the same host --------------------------
+# The hub lives under the API host so its subscriber cookie `mercureAuthorization`
+# (host-only, Path=/.well-known/mercure) never has to be widened (BR-28). The versioned
+# /api/v1/school-link/ routes and the unversioned first-party routes take the same path
+# through this block and are headed identically (BR-15).
+api.{$DOMAIN} {
+	tls {$CADDY_TLS_ARG}
+	encode zstd gzip
+	import access-log
+
+	handle /.well-known/mercure* {
+		# SSE: no buffering, no compression on the stream — flush as the hub writes.
+		reverse_proxy mercure:80 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy app:8000
+	}
+}
+
+# ---- media-service ---------------------------------------------------------
+media.{$DOMAIN} {
+	tls {$CADDY_TLS_ARG}
+	import access-log
+	reverse_proxy media:8008
+}
+
+# ---- the object store's public endpoint (BR-32) -----------------------------
+# MinIO cannot emit these, so the proxy is their ONE writer on this host. `defer` applies
+# them after the upstream response so an upstream header of the same name is replaced,
+# never duplicated (AC-18: exactly once). No CSP (no HTML is served here), no COEP.
+storage.{$DOMAIN} {
+	tls {$CADDY_TLS_ARG}
+	import access-log
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-site"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+		defer
+	}
+	reverse_proxy storage:9000
+}

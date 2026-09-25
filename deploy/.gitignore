@@ -1,0 +1,12 @@
+# deploy/.env is HOST STATE (the {SERVICE}_TAG lines deploy.sh maintains, DOMAIN, the TLS
+# argument) — never committed; deploy/rehearsal/templates/deploy.env.template documents it.
+.env
+.env.*
+!.env.example
+
+# Secrets live on the host at /srv/trades/secrets/ (deployment.md § "Secrets in production");
+# a `secrets/` directory next to this file is a mistake wherever it comes from.
+secrets/
+
+# The rehearsal's scratch tree: generated env files, keys, dumps, log archive, the local CA.
+rehearsal/.scratch/

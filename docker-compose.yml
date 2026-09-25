@@ -24,7 +24,9 @@ services:
     # emulation on Apple Silicon (slow). This variant runs natively on both
     # arches, so no platform pin is needed. Same PG 18 + PostGIS 3.6 → the
     # existing postgres_data volume is compatible (no re-init).
-    image: imresamu/postgis:18-3.6
+    # Digest-pinned (BR-2, `make image-pins` — a tag is not a pin). Re-resolve after a bump
+    # with `docker buildx imagetools inspect imresamu/postgis:<tag>`.
+    image: imresamu/postgis:18-3.6@sha256:b5766ee720aca09c61b9a868abefbf273348a4b90ad4cf146b4f8c9ac85d48e4
     container_name: trades-postgres
     # Every service in the workspace depends on this container AND uses it as the
     # `doctrine://` Messenger transport, so it must come back with the Docker daemon
@@ -83,7 +85,10 @@ services:
   # ADR in `../trades-docs/decisions.md`, not a citation.
 
   mailpit:
-    image: axllent/mailpit:latest
+    # Off `latest` and digest-pinned (production-packaging-promotion-lane BR-2): it was the
+    # only unpinned image across the four code repositories. Development only — production
+    # uses the real mailer (deploy/docker-compose.prod.yml has no mailpit).
+    image: axllent/mailpit:v1.31.2@sha256:74d609a42ec279aa63c6b4622a6fa9b5408d1ad5b1d76a1c4be40a265ce0863d
     container_name: trades-mailpit
     # Same reason as postgres above: services send through it, so it returns with them.
     restart: unless-stopped
@@ -105,7 +110,8 @@ services:
     # break operator dashboards on freshclam warnings. The -debian13-slim
     # variant is multi-arch (amd64 + arm64 + ppc64le) so Apple Silicon hosts
     # run it natively; the bare `1.5.2` tag is Alpine-amd64-only.
-    image: clamav/clamav:1.5.2-debian13-slim
+    # Digest-pinned (BR-2). Re-resolve with `docker buildx imagetools inspect clamav/clamav:<tag>`.
+    image: clamav/clamav:1.5.2-debian13-slim@sha256:14e2e0805c6a5ff6728ea591c05565e0f0954d93e8701919012c3a8c44e20674
     container_name: trades-clamav
     restart: unless-stopped
     ports:

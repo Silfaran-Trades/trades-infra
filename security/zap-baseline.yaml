@@ -1,0 +1,88 @@
+# OWASP ZAP baseline scan profile — Trades (AS-021, rung 1; production-packaging-promotion-lane).
+# Adapted from ai-standards/templates/ci/zap-baseline.yaml.template.
+#
+# Consumed by `make dast-baseline URL=…` in this repo (the passive baseline, run once against
+# the rehearsal perimeter — spec § Open Questions; and on demand before a release / after any
+# perimeter change). GitHub Actions being disabled (B-6), the local lane is the one that runs.
+# A HIGH finding blocks unless accepted in trades-docs/decisions.md.
+# Authoritative framing: ai-standards/standards/attack-surface-hardening.md
+# § "Active scanning (DAST)".
+#
+# Format (zaproxy/action-baseline): TAB-separated columns
+#
+#   <rule-id>	<WARN|IGNORE|FAIL>	(<free-text reason>)
+#
+#   FAIL   → fails the job → blocks the release  (use for the rules the standards make hard)
+#   WARN   → reported, does not block             (triage it; do not let it become wallpaper)
+#   IGNORE → not reported at all                  (ONLY with a written reason + an ADR/decision)
+#
+# Discipline: an IGNORE line is an accepted risk. Every one carries its reason inline AND a
+# matching entry in {project-docs}/decisions.md (or the accepted-risks list in
+# security-flows.md). Silencing a rule with no reason is exactly the drift this file exists
+# to prevent — the profile is reviewed whenever the perimeter changes.
+#
+# The FAIL set below mirrors the AS-* rules the standards already make non-negotiable, so a
+# ZAP finding and a reviewer finding cite the same underlying rule.
+#
+# The "HIGH blocks" promise above is NOT kept by these levels alone: every rule this file does
+# not list defaults to WARN, and `make dast-baseline` passes `-I` so WARN stays report-only —
+# a High-risk alert from an unlisted rule would exit 0. It is kept by a second gate the same
+# target runs over the FULL JSON report, scripts/checks/check-zap-high-alerts.py: ANY High-risk
+# alert on the scanned host fails the run unless THIS file carries an IGNORE line for that rule
+# whose reason cites the accepting ADR (`ADR-NNN`) or `decisions.md`. A WARN line never accepts
+# a High; an OUTOFSCOPE line never accepts a High (it scopes the summary, it records no
+# decision). So the line an accepted High needs is exactly the one the discipline above already
+# demands — reason inline, decision recorded — and the citation is what the gate reads.
+
+# --- Transport & headers (AS-001, AS-002, AS-004) ---------------------------------
+10035	FAIL	(Strict-Transport-Security missing/invalid — AS-002)
+10038	FAIL	(Content-Security-Policy header missing — AS-001)
+# 10038 is SCOPED, not silenced: AS-001 governs HTML responses, and the two JSON API hosts
+# answer JSON on every route, 404s included (ApiExceptionSubscriber), carrying no CSP by
+# decision — spec `production-packaging-promotion-lane` § Technical Details ("JSON API
+# responses carry no Content-Security-Policy") and ADR-120 § Decision 1 (each deployable
+# writes its own headers; the policy is the SPA image's). The rule stays FAIL on app.{domain},
+# the HTML host, where a missing policy IS the AS-001 defect. The regex is anchored at the
+# start of the URL and is a PREFIX match (`re.match`) — in zap-baseline.py's classic path,
+# which the Makefile pins with `--autooff`: the Automation Framework path turns this line into
+# an alert filter whose summary still counts the rule as FAIL (rehearsal, D7 — see the
+# Makefile's `dast-baseline` comment). The domain part is deliberately open so the rehearsal
+# (`trades.test`) and production share one line.
+10038	OUTOFSCOPE	^https://(api|media)\.[^/]+/
+10055	FAIL	(CSP: unsafe-inline / unsafe-eval / wildcard directive — AS-001)
+10020	FAIL	(Missing anti-clickjacking header — AS-001 frame-ancestors / X-Frame-Options)
+10021	FAIL	(X-Content-Type-Options missing — nosniff baseline)
+90004	WARN	(Cross-Origin isolation headers COOP/CORP/COEP — AS-004; WARN while COEP is staged)
+
+# --- Cookies (AS-003, AS-029) ------------------------------------------------------
+10011	FAIL	(Cookie without Secure flag — AS-003)
+10010	WARN	(Cookie without HttpOnly — legitimate ONLY for the double-submit CSRF cookie, AS-029; triage every hit)
+10054	FAIL	(Cookie without SameSite attribute — AS-003)
+
+# --- Cache isolation (AS-028) ------------------------------------------------------
+# 10015 is WARN, not FAIL: the rule fires on every successful text response whose Cache-Control
+# lacks `no-store`, and it cannot see whether a body varies by the session cookie — which is
+# the only thing AS-028 is about. On this perimeter it fires on behaviour the spec mandates:
+# the SPA document's `Cache-Control: no-cache` (BR-15a, so a new build's policy and hash are
+# never paired with a cached page), `/api/health`'s `no-cache, private`, and any public,
+# principal-independent GET that `caching.md` says stays cacheable. A FAIL that fires on
+# standards-compliant responses is not a gate. Reported, not silenced: triage every hit — a
+# cookie-varying response without `private, no-store` + `Vary: Cookie` IS an AS-028 defect.
+# Both rules raise Informational-RISK alerts, which the classic summary line does not list:
+# read them in security/reports/zap-baseline.md (the Makefile's `dast-baseline` comment).
+10015	WARN	(Re-examine Cache-control — triage against AS-028; fires on spec-mandated `no-cache` (BR-15a) and on cacheable public GETs, so it cannot block)
+10049	WARN	(Storable & cacheable content — triage against AS-028: cookie-varying responses are private, no-store)
+
+# --- Information leakage (SE-007) --------------------------------------------------
+10036	WARN	(Server leaks version information via Server / X-Powered-By — SE-007)
+10037	WARN	(Server leaks info via X-Powered-By-style headers — SE-007)
+10027	WARN	(Information disclosure in comments / suspicious content)
+10096	IGNORE	(Timestamp disclosure — noisy on any page rendering dates; not a finding for this product)
+
+# --- Injection-adjacent passive signals --------------------------------------------
+10202	WARN	(Absence of anti-CSRF tokens — expected on a Bearer-authenticated SPA; triage per AS-005)
+10017	WARN	(Cross-domain JavaScript source file inclusion — check SRI, AS-025)
+
+# --- Project-specific accepted risks (add below; reason + decisions.md entry MANDATORY) ---
+# None yet. The 10.4 rehearsal run is the first baseline; whatever it finds is either fixed
+# or recorded here WITH its ADR — never silenced without one.
