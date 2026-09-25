@@ -1,0 +1,25 @@
+# gitleaks configuration for trades-infra (`make gitleaks`, run by `make quality` and CI).
+#
+# The scan is a WORKING-TREE scan (`gitleaks dir`), on purpose: a gitignored secret file that
+# should never exist under this repository is caught too, not only a committed one. One tree is
+# the exception by design — the rehearsal harness (deploy/rehearsal/rehearse.sh) generates its
+# scratch secrets (env files, the JWT key pair, the FCM placeholder, the backup age identity)
+# under deploy/rehearsal/.scratch/, gitignored and chmod 700; that IS the declared secret store
+# of the local first-deploy rehearsal, so every developer machine that has rehearsed carries
+# real-shaped secrets there. Scanning it makes the gate red by construction after every
+# rehearsal (28 findings on 2026-09-25, all under .scratch/secrets/). The allowlist below is
+# exactly that path and nothing else: `security/reports/` and every other gitignored location
+# stay scanned.
+#
+# Every default rule stays in force (`useDefault = true`).
+
+title = "trades-infra"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "the rehearsal's generated scratch secrets — deploy/rehearsal/rehearse.sh's declared, gitignored secret store"
+paths = [
+  '''deploy/rehearsal/\.scratch/''',
+]

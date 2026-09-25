@@ -1,0 +1,342 @@
+# Trades — production compose, single-host baseline (production-packaging-promotion-lane, BR-18).
+# Derived from ai-standards/templates/deploy/docker-compose.prod.yml.template.
+# Authoritative rules: ai-standards/standards/deployment.md; perimeter: ADR-120.
+#
+# WHAT RUNS (the runtime set, RUNBOOK.md § "The runtime set"):
+#   caddy               the perimeter — the ONLY service publishing host ports (80/443)
+#   app                 trades-backend (php-fpm + nginx under supervisord), the one MIGRATOR
+#   worker-default      trades-backend image, `messenger:consume async_default`
+#   worker-heavy        trades-backend image, `messenger:consume async_heavy`
+#   worker-scheduler    trades-backend image, the nine `schedule://` transports (18 jobs)
+#   mercure             the Chat SSE hub, served at api.{DOMAIN}/.well-known/mercure
+#   media               media-service (php-fpm + nginx + its two workers under supervisord)
+#   clamav              the antivirus daemon the media scan worker calls
+#   storage / storage-init   MinIO (ADR-021 still open) + the one-shot bucket bootstrap
+#   postgres            PostgreSQL 18 + PostGIS — one instance, `trades_app` + `media`
+#
+# INTERPOLATION comes from `deploy/.env` (host state, gitignored; documented in
+# rehearsal/templates/deploy.env.template): APP_TAG / MEDIA_TAG / WEB_TAG (full git SHAs,
+# maintained by deploy.sh — never by hand, never `latest`), DOMAIN, CADDY_TLS_ARG, and
+# optionally TRADES_SECRETS_DIR (default /srv/trades/secrets) + TRADES_PROD_SUBNET.
+#
+# SECRETS never live in this file: `env_file:` points at the host's per-service env files
+# (deployment.md § "Secrets in production"; chmod 600, gitignored) and file-shaped secrets
+# (the JWT key pair, the FCM credentials, the dummy password hash) are mounted READ-ONLY from
+# {TRADES_SECRETS_DIR}/files/ — never baked into an image (SC-006).
+#
+# HARDENING (BR-4, AS-019): every service runs `read_only: true`; tmpfs only where the process
+# writes. The three deployables run as non-root inside their images. Container logs: the
+# `local` driver caps the LIVE buffer's size — it is not retention; durability is the
+# `caddy-logs` volume (the perimeter's own file) + deploy.sh's pre-recreate archive (DE-007).
+#
+# NETWORK: one bridge with a FIXED subnet. `TRUSTED_PROXIES` in app.env / media.env names
+# this subnet (BR-30) — the backends trust `X-Forwarded-*` only from it, and Caddy is the
+# only thing on it that speaks to the internet.
+#
+# Images: the three deployables are SHA-tagged (built by the CD job / the rehearsal from
+# digest-pinned Dockerfiles); every infrastructure image below is digest-pinned (BR-2,
+# `make image-pins`). Re-resolve with `docker buildx imagetools inspect <image>:<tag>`.
+
+name: trades-prod
+
+networks:
+  prod-network:
+    name: trades-prod-network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${TRADES_PROD_SUBNET:-172.30.0.0/24}
+
+volumes:
+  postgres-data:
+  storage-data:
+  clamav-db:
+  caddy-data:      # certificates — losing this re-issues certs (rate-limited!)
+  caddy-config:
+  # The perimeter's request log (LO-009 / DE-007): a named volume outlives every recreate.
+  caddy-logs:
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks: [prod-network]
+  # LIVE BUFFER ONLY — bounds what an unbounded talker can do to the disk. Not retention.
+  logging:
+    driver: local
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+# Everything the app container and its three workers share: the same image + tag (a worker
+# carries NO separate tag — deploy.sh recreates them on APP_TAG after the app), the same
+# env file, the same read-only posture, the same secret files.
+x-app-common: &app-common
+  <<: *service-defaults
+  image: ghcr.io/silfaran-trades/trades-backend:${APP_TAG:?run deploy.sh}
+  env_file:
+    - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/app.env
+  read_only: true
+  # var/ (compiled cache, logs) is PER CONTAINER: each one rebuilds its own cache at start
+  # (docker/entrypoint.sh, DE-001) — 1 GB warmup ceiling, so the tmpfs is sized to hold the
+  # compiled container plus logs. /tmp: php-fpm, nginx (temp paths, pid), supervisord.
+  tmpfs:
+    - /tmp:size=256m,mode=1777
+    - /var/www/html/var:size=512m,uid=33,gid=33,mode=0750
+  volumes:
+    - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/files:/run/secrets/files:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---- the perimeter --------------------------------------------------------------------
+  caddy:
+    <<: *service-defaults
+    # Pinned to the 2.11 MINOR the Caddyfile was verified on (roll_interval, ip_mask are
+    # version-dependent), plus the digest. On a bump re-run deployment.md § DE-004 checks.
+    image: caddy:2.11@sha256:0c994536bddb66445885237f1a5dcc1916bccea922661c76b4e9fc24061f9b52
+    # The ONLY published ports. The two variables exist for the rehearsal machine (a developer
+    # laptop may already hold 80/443); production leaves them at the defaults.
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+    environment:
+      # Substituted into the Caddyfile at parse time ({$DOMAIN}, {$CADDY_TLS_ARG}).
+      DOMAIN: ${DOMAIN:?set DOMAIN in deploy/.env}
+      # `tls <email>` (ACME, production) or `tls internal` (the rehearsal's local CA).
+      CADDY_TLS_ARG: ${CADDY_TLS_ARG:?set CADDY_TLS_ARG in deploy/.env}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+      # ⚠ ADDING A VOLUME NEEDS `up -d`, NOT `restart` (see the template's warning): a restart
+      # reuses the old mount set and Caddy silently logs into its own writable layer instead.
+      - caddy-logs:/var/log/caddy
+    healthcheck:
+      # The admin API answers on loopback only; a 200 here proves the config loaded.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---- trades-backend: the app + the three workers, ONE image ----------------------------
+  app:
+    <<: *app-common
+    environment:
+      # The ONE container that applies migrations (BR-7). Workers never do.
+      RUN_MIGRATIONS: "1"
+    healthcheck:
+      # 127.0.0.1, never localhost (busybox-style resolvers try ::1 first). The prod image ships
+      # curl; deploy.sh's readiness gate execs the same probe.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # migrations + cache:clear + a 1 GB warmup happen before nginx answers
+      start_period: 180s
+
+  # Workers wait for the app to be HEALTHY: that staggers the four 1 GB compiles by
+  # construction and keeps them off a schema the migrations have not reached (spec § Open
+  # Questions). The entrypoint's `exec` makes `php` PID 1 — the healthcheck asserts exactly
+  # that (DE-003), never `pgrep -f` (which matches a wrapping shell and flaps mid-warmup).
+  worker-default:
+    <<: *app-common
+    command: ["php", "bin/console", "messenger:consume", "async_default", "--time-limit=3600", "--memory-limit=128M"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      app: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$(cat /proc/1/comm)\" = php ] || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+  worker-heavy:
+    <<: *app-common
+    command: ["php", "bin/console", "messenger:consume", "async_heavy", "--time-limit=3600", "--memory-limit=256M"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      app: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$(cat /proc/1/comm)\" = php ] || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+  # The nine `schedule://` transports — the same positional list as trades-backend's
+  # docker-compose.yml (which ConsumedTransportRetryStrategyTest parses; keep them equal).
+  # The five MODULE_* flags and DEMAND_AI_WRITTEN_PARSE_ENABLED are resolved at container
+  # COMPILE time: a flip is `up -d --force-recreate app worker-scheduler`, never a restart
+  # (BR-22, RUNBOOK.md § "Feature flags").
+  worker-scheduler:
+    <<: *app-common
+    command: ["php", "bin/console", "messenger:consume", "scheduler_default", "scheduler_contracts", "scheduler_labor", "scheduler_serviceorders", "scheduler_company", "scheduler_profile", "scheduler_demand", "scheduler_telemetry", "scheduler_audit", "--time-limit=3600", "--memory-limit=128M"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      app: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "[ \"$(cat /proc/1/comm)\" = php ] || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+  # ---- Mercure hub — Chat's SSE transport, served under api.{DOMAIN}/.well-known/mercure ----
+  # DEDICATED hub keypair (never the Lexik identity key). mercure.env carries
+  # MERCURE_PUBLISHER_JWT_KEY (MUST equal app.env's MERCURE_JWT_SECRET) and
+  # MERCURE_SUBSCRIBER_JWT_KEY (MUST equal app.env's) — the rehearsal writes both from one
+  # generated value; in production the runbook's rotation step changes both files together.
+  mercure:
+    <<: *service-defaults
+    image: dunglas/mercure:v0.16@sha256:0612e5cb86e276fba6df5bade62a0a2ef25051af270f8b569caf053be9c245ac
+    env_file:
+      - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/mercure.env
+    environment:
+      SERVER_NAME: ":80"
+      GLOBAL_OPTIONS: auto_https off
+      # Explicit SPA origin — never `*` (invariants.md). Separate from the app's
+      # CORS_ALLOW_ORIGIN; both name the same origin.
+      MERCURE_EXTRA_DIRECTIVES: cors_origins https://app.${DOMAIN:?set DOMAIN in deploy/.env}
+    read_only: true
+    tmpfs:
+      - /data:size=64m
+      - /config:size=16m
+      - /tmp:size=16m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---- media-service: php-fpm + nginx + scan/process workers under supervisord -------------
+  media:
+    <<: *service-defaults
+    image: ghcr.io/silfaran-trades/media-service:${MEDIA_TAG:?run deploy.sh}
+    env_file:
+      - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/media.env
+    environment:
+      RUN_MIGRATIONS: "1"
+    read_only: true
+    # /tmp sized to at least twice the largest accepted upload (200 MiB, services.yaml
+    # `max_bytes`): imagick and the scan worker stage files there (BR-4).
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /var/www/html/var:size=256m,uid=33,gid=33,mode=0750
+    volumes:
+      - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/files:/run/secrets/files:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      storage: { condition: service_healthy }
+      storage-init: { condition: service_completed_successfully }
+      clamav: { condition: service_started }
+    healthcheck:
+      # /api/health (bucket probe) AND both consumers RUNNING under supervisord.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8008/api/health >/dev/null && [ \"$(supervisorctl -c /etc/supervisor/conf.d/supervisord.conf status scan-worker process-worker | grep -c RUNNING)\" = 2 ] || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  clamav:
+    <<: *service-defaults
+    image: clamav/clamav:1.5.2-debian13-slim@sha256:14e2e0805c6a5ff6728ea591c05565e0f0954d93e8701919012c3a8c44e20674
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+      - /run:size=16m
+      - /var/log/clamav:size=32m
+    volumes:
+      - clamav-db:/var/lib/clamav   # signature DB — persists across restarts/recreates
+    healthcheck:
+      test: ["CMD", "clamdscan", "--ping", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s   # freshclam pulls the initial signature DB on first boot
+
+  # ---- object storage (MinIO today; ADR-021 open) — public endpoint storage.{DOMAIN} --------
+  storage:
+    <<: *service-defaults
+    # Digest provenance: the manifest-list digest Docker recorded for this tag at the
+    # 2026-08-28 pull (quay.io refused anonymous manifest queries on 2026-09-25).
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    command: ["server", "/data", "--console-address", ":9001"]
+    env_file:
+      - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/storage.env   # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    volumes:
+      - storage-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot bucket bootstrap (idempotent). `media` waits for it to complete successfully.
+  storage-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    networks: [prod-network]
+    restart: "no"
+    env_file:
+      - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/storage.env
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+      - /root/.mc:size=16m
+    depends_on:
+      storage: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until mc alias set local http://storage:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
+          echo 'waiting for storage...'; sleep 1
+        done
+        mc mb --ignore-existing local/media-public
+        mc mb --ignore-existing local/media-private
+        mc anonymous set download local/media-public
+        : > /tmp/.bootstrap-probe
+        mc cp /tmp/.bootstrap-probe local/media-public/.bootstrap-probe
+        echo 'media-public (anonymous download) + media-private buckets ready'
+
+  # ---- PostgreSQL 18 + PostGIS — one instance, `trades_app` + `media` ------------------------
+  postgres:
+    <<: *service-defaults
+    image: imresamu/postgis:18-3.6@sha256:b5766ee720aca09c61b9a868abefbf273348a4b90ad4cf146b4f8c9ac85d48e4
+    env_file:
+      - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/postgres.env   # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+      - /var/run/postgresql:size=16m
+    volumes:
+      # Postgres 18 expects the mount at /var/lib/postgresql (NOT /data) — versioned layout.
+      - postgres-data:/var/lib/postgresql
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---- the SPA: a static-file image (vite build + unprivileged nginx on 8080) ---------------
+  web:
+    <<: *service-defaults
+    image: ghcr.io/silfaran-trades/trades-front:${WEB_TAG:?run deploy.sh}
+    # No env_file: VITE_* are build-time, and secrets are never safe there anyway. The image's
+    # nginx emits the SPA's own security headers (CSP, HSTS, COOP/CORP — BR-15a) and logs
+    # with the lo009 format (LO-009).
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5

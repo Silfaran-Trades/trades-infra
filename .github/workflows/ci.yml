@@ -1,0 +1,63 @@
+# GitHub Actions — trades-infra CI: the repository's FIRST check (production-packaging-promotion-lane,
+# BR-25; AC-17). Adapted from ai-standards/templates/ci/infra-ci.yml.template — no Terraform yet
+# (10.6 adds the IaC and its fmt/validate steps to this file), so the check set is the deploy
+# configuration's: shellcheck on every script, `docker compose config` on both compose files,
+# `caddy adapt` with the adapted JSON read back, actionlint, the compose image-pin check and a
+# gitleaks working-tree scan. All of it is `make quality`, so CI and the developer's machine run
+# the SAME digest-pinned containers — the check name below (`quality`) is what the repository
+# ruleset requires (the ruleset is created by the developer — a human act).
+#
+# Read-only and credential-free by construction: nothing here applies, deploys or reads state.
+#
+# STATE OF RECORD (ADR-121): GitHub Actions is DISABLED on this repository (pending item B-6).
+# This workflow is linted (actionlint) but has never executed; while a required check can never
+# report, every trades-infra PR merges through the administrator bypass the other four
+# repositories use today, and the local `make quality` run is the verification of record —
+# every PR says so.
+
+name: trades-infra CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # One step per gate (the same shape as the code repos' CI): a red names the gate.
+      - name: shellcheck (deploy, backup, restore, sentinel, rehearsal, checks)
+        run: make shellcheck
+
+      - name: docker compose config (dev + prod)
+        run: make compose-config
+
+      - name: caddy adapt — adapted JSON read back (LO-009 filters, roll ceilings, one HSTS writer)
+        run: make caddy-adapt
+
+      - name: actionlint
+        run: make actionlint
+
+      - name: "Compose image pins (every image line carries @sha256)"
+        run: make image-pins
+
+      - name: gitleaks (working tree)
+        run: make gitleaks
+
+      - name: "DAST High backstop self-test (AS-021: the check-zap-high-alerts gate observed failing)"
+        run: make dast-high-selftest

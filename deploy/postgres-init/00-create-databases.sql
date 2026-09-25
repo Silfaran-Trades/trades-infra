@@ -1,0 +1,14 @@
+-- Production databases for the Trades stack (deploy/docker-compose.prod.yml).
+--
+-- Runs ONCE, on the FIRST postgres boot against an empty data volume. Editing it does not
+-- touch an existing cluster. The development script one level up (../../infra/postgres/init/)
+-- additionally creates the two *_test databases — those have no business in production.
+--
+-- `trades_app` (the modular-monolith app: each bundle owns a SCHEMA inside it, created by the
+-- app's own Phinx migrations at container start — never here) is NOT created by this file: it
+-- is POSTGRES_DB in postgres.env, which the image creates itself before running this script.
+-- A `CREATE DATABASE trades_app;` here would fail with "already exists" — and the entrypoint
+-- runs psql with ON_ERROR_STOP, so the line AFTER it would never run (measured on the first
+-- 10.4 rehearsal: media-service crash-looped on 'database "media" does not exist').
+-- PostGIS is enabled per database by the app's migrations where a bundle needs it.
+CREATE DATABASE media;

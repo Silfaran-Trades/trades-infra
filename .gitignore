@@ -1,1 +1,7 @@
 .DS_Store
+postgres
+
+# Scan artefacts written by `make dast-baseline` / `make sbom` — not source. `zap.yaml` is the
+# automation plan zap-baseline.py drops into its working directory (this repo root) on every run.
+security/reports/
+/zap.yaml
