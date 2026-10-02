@@ -1,38 +1,63 @@
-# Trades — the perimeter (Caddy 2.11): TLS termination, one hostname per deployable (BR-28),
-# safe-by-construction request logs (BR-13, LO-009, GD-005), NO application security headers.
+# Trades — the perimeter (Caddy 2.11): TLS termination, one hostname per deployable (BR-28 of
+# 10.4), safe-by-construction request logs (BR-13, LO-009, GD-005), and — since 10.6 — the
+# stage-1 privacy perimeter: basic auth on the SPA and the mail viewer, `noindex` everywhere,
+# and the security-header floor on the responses the proxy generates itself.
 # Derived from ai-standards/templates/deploy/Caddyfile.template — the (log-redaction) and
-# (access-log) snippets are the template's, verbatim. Perimeter decisions: ADR-120.
+# (access-log) snippets are the template's, verbatim. Perimeter decisions: ADR-120 (amended
+# by 10.6: the proxy-generated-response carve-out, BR-20) and ADR-124 (the stage-1 perimeter,
+# BR-18, BR-21 — basic auth, noindex and the sslip.io hostname go together at the 10.9 go-live;
+# the floor stays).
 #
 # ENV PLACEHOLDERS (substituted at parse time from docker-compose.prod.yml `environment:`):
-#   {$DOMAIN}         the production domain (10.6's decision) — `trades.test` in the rehearsal
-#   {$CADDY_TLS_ARG}  `tls` argument: an ACME email in production, `internal` in the
-#                     rehearsal (Caddy's local CA; the harness trusts its root explicitly —
-#                     verification is never switched off, invariants.md)
+#   {$DOMAIN}            the base hostname — `<eip-with-dashes>.sslip.io` in stage 1 (BR-15),
+#                        `trades.test` in the rehearsal
+#   {$CADDY_TLS_ARG}     `tls` argument: the ACME e-mail in production (which also enables
+#                        Caddy's ZeroSSL fallback — every sslip.io certificate shares Let's
+#                        Encrypt's rate limits with every other sslip.io user, BR-16),
+#                        `internal` in the rehearsal (Caddy's local CA; the harness trusts its
+#                        root explicitly — verification is never switched off, invariants.md)
+#   {$BASIC_AUTH_USER}   the ONE shared operational credential of stage 1 (BR-18); the hash
+#   {$BASIC_AUTH_HASH}   comes from `caddy hash-password` and lives ONLY in deploy/.env,
+#                        single-quoted (BR-19). Never in this file, never in a repository.
 #
 # HOSTS:
-#   app.{$DOMAIN}      → web:8080       the SPA (its nginx emits CSP/HSTS/COOP/CORP itself)
-#   api.{$DOMAIN}      → app:8000       trades-backend; /.well-known/mercure* → mercure:80
-#   media.{$DOMAIN}    → media:8008     media-service
+#   app.{$DOMAIN}      → web:8080       the SPA — BASIC AUTH (its nginx emits CSP/HSTS/COOP/CORP)
+#   api.{$DOMAIN}      → app:8000       trades-backend; /.well-known/mercure* → mercure:80 — EXEMPT
+#   media.{$DOMAIN}    → media:8008     media-service — EXEMPT
 #   storage.{$DOMAIN}  → storage:9000   the object store's public endpoint (presigned URLs,
-#                                        public media) — the ONE host whose security headers
-#                                        this file sets, because the store cannot (BR-32)
+#                                        public media) — EXEMPT; the ONE host whose security
+#                                        headers this file sets unconditionally (BR-32 of 10.4)
+#   mail.{$DOMAIN}     → mailpit:8025   the stage-1 captured-mail viewer (BR-25) — BASIC AUTH
+#
+# WHY api./media./storage. ARE EXEMPT (BR-18): HTTP Basic and the API's Bearer token share
+# the Authorization header, so gating the API would break every SPA call and the login
+# itself; the storage host serves presigned URLs; the hub lives on api. Those hosts keep their
+# permanent posture (JWT, rate limits, CORS pinned to the app. origin).
 #
 # RULES THIS FILE MUST KEEP:
-#   - NO security headers on app./api./media. — CSP/HSTS/COOP/CORP are application-emitted
-#     (AS-001..AS-004, BR-15a); a header set in two places drifts in two places. Only the
-#     storage host block carries a `header` directive, and each header still has exactly one
-#     writer per host.
+#   - Upstreams remain the sole authors of everything they serve (AS-001..AS-004, BR-15a of
+#     10.4). The ONE carve-out (BR-20, ADR-120 amended): responses the PROXY GENERATES ITSELF —
+#     the basic-auth 401, the 502/503 of a down upstream — carry the (security_floor) below in
+#     set-if-absent form (`header ?Field`), so an upstream-emitted header ALWAYS wins. The
+#     snippet is imported at site level AND inside every handle_errors: deferred `?` defaults
+#     do NOT ride Caddy's error lane, and the error lane is exactly where every proxy-generated
+#     response is born — the second import is load-bearing, never remove it. The storage host
+#     keeps its explicit header block, which wins over a deferred default, so it still has one
+#     writer per header.
+#   - The error lane answers `{err.status_code} {err.status_text}` and nothing else (no
+#     internals, SE-004), marked `Cache-Control: private, no-store` (AS-028) — auth-required
+#     and 4xx/5xx responses are never stored by a shared cache.
+#   - `X-Robots-Tag: noindex` on EVERY site (BR-18) — a robots directive, not a security header.
 #   - Every site block imports (access-log): Caddy logs NOTHING about requests without an
-#     explicit `log` directive.
-#   - The redaction filter is imported TWICE — into the global default logger (which carries
-#     the http.log.error.* channel a 502 writes with the full request line) and into every
-#     access log. Importing it in one place only is the failure the template's comment
-#     describes.
+#     explicit `log` directive. The redaction filter is imported TWICE — into the global
+#     default logger (the http.log.error.* channel a 502 writes with the full request line)
+#     and into every access log.
 #   - Caddy trusts no upstream proxy here, so a caller's forged X-Forwarded-For is overwritten
-#     with the real address before the backends see it (AC-22); the backends in turn trust
-#     only this proxy's subnet (BR-30).
+#     with the real address before the backends see it; the backends trust only this proxy's
+#     subnet (BR-30 of 10.4).
 #
-# VERIFY BY READING AN EMITTED LINE, never by `caddy validate` (the lexer trap below).
+# VERIFY BY READING AN EMITTED LINE / THE ADAPTED JSON (scripts/checks/check-caddyfile.sh),
+# never by `caddy validate` alone (the lexer trap below).
 
 # ---- the redaction filter, applied to BOTH request-logging channels ---------
 (log-redaction) {
@@ -106,23 +131,64 @@
 	}
 }
 
-# ---- the SPA ----------------------------------------------------------------
+# ---- the security-header floor on PROXY-GENERATED responses (BR-20) ---------
+# KHA's ADR-050 carve-out, copied: HSTS byte-identical to the upstreams; the CSP is the
+# API's minimal deny policy (never the SPA's rich policy); CORP `same-site` (the
+# non-HTML precedent). `?` = set only where the header is absent — an upstream header
+# always wins; on normal upstream traffic this is a no-op by construction (every
+# upstream emits the full set), on a 401 / 502 / 503 it is the only writer.
+(security_floor) {
+	header ?Strict-Transport-Security "max-age=63072000; includeSubDomains"
+	header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+	header ?X-Content-Type-Options "nosniff"
+	header ?Referrer-Policy "strict-origin-when-cross-origin"
+	header ?Cross-Origin-Opener-Policy "same-origin"
+	header ?Cross-Origin-Resource-Policy "same-site"
+}
+
+# ---- the error lane, imported by EVERY site block (BR-20, AS-028, SE-004) ----
+# handle_errors is where the basic-auth 401 and a down upstream's 502 / 503 are
+# written. The floor import here is LOAD-BEARING (see the header: deferred `?`
+# defaults skip this lane without it). `respond` preserves the error status
+# verbatim and the body is the bare status line — no internals. Cache-Control is
+# an immediate set (no `?`): nothing upstream ever writes this lane, and an error
+# response must be uncacheable unconditionally — error-lane ONLY, never moved
+# into (security_floor), which also rides normal upstream traffic at site level.
+# WWW-Authenticate is set by basic_auth before the error propagates, so the 401
+# challenge keeps working.
+(error_lane) {
+	handle_errors {
+		import security_floor
+		header Cache-Control "private, no-store"
+		respond "{err.status_code} {err.status_text}"
+	}
+}
+
+# ---- the SPA — behind basic auth (BR-18) -----------------------------------
 app.{$DOMAIN} {
 	tls {$CADDY_TLS_ARG}
 	encode zstd gzip
 	import access-log
+	import security_floor
+	header X-Robots-Tag "noindex"
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
 	reverse_proxy web:8080
+	import error_lane
 }
 
-# ---- the backend + the Mercure hub on the same host --------------------------
+# ---- the backend + the Mercure hub on the same host — EXEMPT -----------------
 # The hub lives under the API host so its subscriber cookie `mercureAuthorization`
-# (host-only, Path=/.well-known/mercure) never has to be widened (BR-28). The versioned
-# /api/v1/school-link/ routes and the unversioned first-party routes take the same path
-# through this block and are headed identically (BR-15).
+# (host-only, Path=/.well-known/mercure) never has to be widened (BR-28 of 10.4). The
+# versioned /api/v1/school-link/ routes and the unversioned first-party routes take the
+# same path through this block and are headed identically (BR-15 of 10.4).
 api.{$DOMAIN} {
 	tls {$CADDY_TLS_ARG}
 	encode zstd gzip
 	import access-log
+	import security_floor
+	header X-Robots-Tag "noindex"
 
 	handle /.well-known/mercure* {
 		# SSE: no buffering, no compression on the stream — flush as the hub writes.
@@ -134,26 +200,34 @@ api.{$DOMAIN} {
 	handle {
 		reverse_proxy app:8000
 	}
+
+	import error_lane
 }
 
-# ---- media-service ---------------------------------------------------------
+# ---- media-service — EXEMPT --------------------------------------------------
 media.{$DOMAIN} {
 	tls {$CADDY_TLS_ARG}
 	import access-log
+	import security_floor
+	header X-Robots-Tag "noindex"
 	reverse_proxy media:8008
+	import error_lane
 }
 
-# ---- the object store's public endpoint (BR-32) -----------------------------
+# ---- the object store's public endpoint — EXEMPT (BR-32 of 10.4) -------------
 # MinIO cannot emit these, so the proxy is their ONE writer on this host. `defer` applies
 # them after the upstream response so an upstream header of the same name is replaced,
-# never duplicated (AC-18: exactly once). No CSP (no HTML is served here), no COEP.
+# never duplicated (exactly once). The explicit set below wins over the floor's deferred
+# `?` defaults, so each header keeps one writer. No CSP (no HTML is served here), no COEP.
 storage.{$DOMAIN} {
 	tls {$CADDY_TLS_ARG}
 	import access-log
+	import security_floor
 	header {
 		Strict-Transport-Security "max-age=63072000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
+		X-Robots-Tag "noindex"
 		Referrer-Policy "strict-origin-when-cross-origin"
 		Cross-Origin-Opener-Policy "same-origin"
 		Cross-Origin-Resource-Policy "same-site"
@@ -162,4 +236,22 @@ storage.{$DOMAIN} {
 		defer
 	}
 	reverse_proxy storage:9000
+	import error_lane
+}
+
+# ---- the stage-1 captured-mail viewer — behind basic auth (BR-25, BR-18) ----
+# Mailpit's own UI emits no security headers; the floor's deferred defaults are
+# therefore the writer here too (the one upstream where the "no-op by
+# construction" above does not hold — accepted: the viewer ends at 10.9).
+mail.{$DOMAIN} {
+	tls {$CADDY_TLS_ARG}
+	encode zstd gzip
+	import access-log
+	import security_floor
+	header X-Robots-Tag "noindex"
+	basic_auth {
+		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
+	}
+	reverse_proxy mailpit:8025
+	import error_lane
 }

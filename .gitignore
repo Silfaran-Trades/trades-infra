@@ -5,3 +5,13 @@ postgres
 # automation plan zap-baseline.py drops into its working directory (this repo root) on every run.
 security/reports/
 /zap.yaml
+
+# Terraform working files (production-infrastructure-first-deploy). The LOCK FILE
+# (.terraform.lock.hcl) and terraform.tfvars ARE committed; the provider cache, every state
+# file and every saved plan (secret-bearing, SC-013) never are.
+terraform/**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfplan.json
+terraform/**/crash.log

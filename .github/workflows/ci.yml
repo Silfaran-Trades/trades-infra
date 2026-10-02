@@ -1,19 +1,21 @@
 # GitHub Actions — trades-infra CI: the repository's FIRST check (production-packaging-promotion-lane,
-# BR-25; AC-17). Adapted from ai-standards/templates/ci/infra-ci.yml.template — no Terraform yet
-# (10.6 adds the IaC and its fmt/validate steps to this file), so the check set is the deploy
-# configuration's: shellcheck on every script, `docker compose config` on both compose files,
-# `caddy adapt` with the adapted JSON read back, actionlint, the compose image-pin check and a
-# gitleaks working-tree scan. All of it is `make quality`, so CI and the developer's machine run
-# the SAME digest-pinned containers — the check name below (`quality`) is what the repository
-# ruleset requires (the ruleset is created by the developer — a human act).
+# BR-25; AC-17), extended by production-infrastructure-first-deploy (BR-36) with the IaC gates.
+# Adapted from ai-standards/templates/ci/infra-ci.yml.template. The check set: shellcheck on
+# every script, `docker compose config` on both compose files, `caddy adapt` with the adapted
+# JSON read back, actionlint, the compose image-pin check, a gitleaks working-tree scan, the DAST
+# High-backstop self-test, `terraform fmt`, `terraform validate` (`init -backend=false` — no
+# state, no credentials) and the plan-checker self-test. All of it is `make quality`, so CI and
+# the developer's machine run the SAME digest-pinned containers — the check name below
+# (`quality`) is what the repository ruleset requires (the ruleset is created by the developer —
+# a human act).
 #
-# Read-only and credential-free by construction: nothing here applies, deploys or reads state.
+# Read-only and credential-free by construction: nothing here plans, applies, deploys or reads
+# state. There is NO `terraform plan` here ON PURPOSE (SC-013, IA-004).
 #
-# STATE OF RECORD (ADR-121): GitHub Actions is DISABLED on this repository (pending item B-6).
+# STATE OF RECORD (ADR-125): GitHub Actions is DISABLED on this repository (pending item B-6).
 # This workflow is linted (actionlint) but has never executed; while a required check can never
-# report, every trades-infra PR merges through the administrator bypass the other four
-# repositories use today, and the local `make quality` run is the verification of record —
-# every PR says so.
+# report, every trades-infra PR merges through the administrator bypass, and the local
+# `make quality` run is the verification of record — every PR says so.
 
 name: trades-infra CI
 
@@ -61,3 +63,12 @@ jobs:
 
       - name: "DAST High backstop self-test (AS-021: the check-zap-high-alerts gate observed failing)"
         run: make dast-high-selftest
+
+      - name: terraform fmt (recursive, pinned container)
+        run: make terraform-fmt
+
+      - name: terraform validate (per environment, init -backend=false, read-only lock file)
+        run: make terraform-validate
+
+      - name: "Plan checker self-test (AC-1: check-tf-plan.py observed failing on each forbidden resource)"
+        run: make tf-plan-check-selftest

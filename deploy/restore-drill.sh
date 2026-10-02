@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 #
-# Trades — restore drill: the proof that the encrypted backups actually restore (AC-15).
+# Trades — restore drill: the proof that the encrypted backups actually restore (AC-15 of
+# 10.4; AC-16 / BR-30 of production-infrastructure-first-deploy).
 # Adapted from ai-standards/templates/deploy/restore-drill.sh.template.
 # Authoritative rules: ai-standards/standards/deployment.md § "Backups and the restore drill"
-# (quarterly, mandatory; the drill-record line goes into this repo's README).
+# (quarterly, mandatory; the drill-record line goes into RUNBOOK.md § "Restore drill evidence").
 #
 # Usage:  ./restore-drill.sh /path/to/age-key.txt
 #
 # WHERE it runs: wherever the age PRIVATE key is — OFF the host by design. Both lanes work:
-#   - dev machine: set RCLONE_REMOTE — the newest dump per database is pulled from the off-host
-#     copy (needs docker, age, rclone);
-#   - on-host / rehearsal: leave RCLONE_REMOTE empty — dumps are read from BACKUP_DIR.
+#   - the developer's Mac (the production drill, BR-30): set BACKUPS_BUCKET (`terraform
+#     output backups_bucket`) and run under the operator profile (AWS_PROFILE=trades-prod) —
+#     the NEWEST object under postgres/ per database is fetched from the off-host copy
+#     (needs docker, age, the aws CLI; the operator reads the bucket, the host cannot);
+#   - on-host / rehearsal: leave BACKUPS_BUCKET empty — dumps are read from BACKUP_DIR.
 #
 # Per database:
 #   1. locates the NEWEST dump — copied into a private scratch dir FIRST, so a concurrent
@@ -31,7 +34,10 @@ command -v age >/dev/null 2>&1 || { echo "✗ drill: age not found" >&2; exit 1;
 
 DATABASES=(trades_app media)
 BACKUP_DIR="${BACKUP_DIR:-/srv/trades/backups}"
-RCLONE_REMOTE="${RCLONE_REMOTE:-}"
+BACKUPS_BUCKET="${BACKUPS_BUCKET:-}"
+AWS_REGION="${AWS_REGION:-eu-south-2}"
+export AWS_PAGER=""
+[ -z "$BACKUPS_BUCKET" ] || command -v aws >/dev/null 2>&1 || { echo "✗ drill: BACKUPS_BUCKET set but the aws CLI is not installed" >&2; exit 1; }
 # The production image (docker-compose.prod.yml) — same major, same PostGIS.
 PG_IMAGE="${PG_IMAGE:-imresamu/postgis:18-3.6@sha256:b5766ee720aca09c61b9a868abefbf273348a4b90ad4cf146b4f8c9ac85d48e4}"
 CONTAINER="${RESTORE_DRILL_CONTAINER:-trades-restore-drill}"
@@ -53,10 +59,15 @@ psql_scratch() { docker exec "$CONTAINER" psql -U postgres -d scratch_restore -t
 RECORD=()
 for db in "${DATABASES[@]}"; do
   # --- 1. newest dump, copied into the private scratch dir before anything else --
-  if [ -n "$RCLONE_REMOTE" ]; then
-    newest="$(rclone lsf "$RCLONE_REMOTE" --include "${db}-*.dump.gz.age" | sort | tail -1)"
-    [ -n "$newest" ] || { echo "✗ drill: no ${db}-*.dump.gz.age in $RCLONE_REMOTE" >&2; exit 1; }
-    rclone copyto "$RCLONE_REMOTE/$newest" "$WORKDIR/$newest"
+  if [ -n "$BACKUPS_BUCKET" ]; then
+    # The newest key under postgres/<db>- (the stamp sorts lexically): the off-host copy,
+    # read with the operator profile. `--query` on the sorted listing, `|| true` so an
+    # empty bucket is reported by the check below instead of a cryptic jq-less failure.
+    newest="$(aws s3api list-objects-v2 --region "$AWS_REGION" --bucket "$BACKUPS_BUCKET" \
+      --prefix "postgres/${db}-" --query 'sort_by(Contents, &Key)[-1].Key' --output text 2>/dev/null || true)"
+    case "$newest" in ''|None) echo "✗ drill: no postgres/${db}-*.dump.gz.age in s3://$BACKUPS_BUCKET" >&2; exit 1 ;; esac
+    newest="$(basename "$newest")"
+    aws s3 cp --region "$AWS_REGION" --only-show-errors "s3://${BACKUPS_BUCKET}/postgres/${newest}" "$WORKDIR/$newest"
   else
     src="$(find "$BACKUP_DIR" -maxdepth 1 -name "${db}-*.dump.gz.age" | sort | tail -1)"
     [ -n "$src" ] || { echo "✗ drill: no ${db}-*.dump.gz.age in $BACKUP_DIR" >&2; exit 1; }
@@ -94,7 +105,7 @@ for db in "${DATABASES[@]}"; do
   RECORD+=("$db: $newest — ${reads[*]}")
 done
 
-# --- 5. the drill-record line — copy into trades-infra/README.md ---------------
+# --- 5. the drill-record line — copy into deploy/RUNBOOK.md § "Restore drill evidence" ---
 echo ""
 echo "✓ restore drill OK $(date +%F) — ${RECORD[*]}"
-echo "  (record this line in trades-infra/README.md — deployment.md § Backups)"
+echo "  (record this line in trades-infra/deploy/RUNBOOK.md § \"Restore drill evidence\" — deployment.md § Backups, AC-16)"

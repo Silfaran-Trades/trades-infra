@@ -28,6 +28,17 @@
 #                       derived from `gh auth token` when unset (the credential never touches
 #                       disk, an image layer or this log — it is a BuildKit secret)
 #   SKIP_BUILD=1        reuse the images already built for the repos' current HEAD SHAs
+#   REGISTRY            rehearsal.invalid (default) — the rehearsal registry NAME the local
+#                       builds and the cached object-store images are tagged under, so the
+#                       production compose's `${REGISTRY}/trades/<name>` references resolve
+#                       OFFLINE (10.6, BR-36). Nothing is ever pushed there.
+#
+# Rehearsal-only deviations from the committed deploy/ (each applied to the SCRATCH COPY, never
+# to the committed files): the object-store images by tag (above); and the app containers
+# trusting Caddy's local CA root through a merged CA bundle mounted over the image's bundle
+# path (write_deploy_env + trust_perimeter_ca) — the synthetic-data lane's presigned uploads go
+# through the perimeter, and in production that site carries a publicly trusted certificate.
+# TLS verification is never switched off anywhere (SE-003).
 #
 # Host tools: docker (with BuildKit), age + age-keygen (already on the developer machine; on
 # the production host 10.6's user-data installs them — the backup lane needs them there).
@@ -52,12 +63,26 @@ CADDY_HTTP_PORT="${CADDY_HTTP_PORT:-80}"
 CADDY_HTTPS_PORT="${CADDY_HTTPS_PORT:-443}"
 TRADES_PROD_SUBNET="${TRADES_PROD_SUBNET:-172.30.0.0/24}"
 REHEARSE_SERVICES="${REHEARSE_SERVICES:-app media web}"
-REGISTRY_NS="ghcr.io/silfaran-trades"
+# The rehearsal registry name (10.6): a reserved, unresolvable host — a typo'd `docker pull`
+# can never reach a real registry. Production's REGISTRY is `terraform output registry`.
+REGISTRY="${REGISTRY:-rehearsal.invalid}"
+REGISTRY_NS="$REGISTRY/trades"
+
+# The cached object-store images (ADR-126): the exact 10.4 references, present only in the
+# developer's local cache — upstream no longer serves them. The rehearsal re-tags them under
+# the rehearsal registry name; production runs the ECR-mirrored copies by digest.
+MINIO_SRC="quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+MC_SRC="quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
+MINIO_TAG="$REGISTRY_NS/minio:RELEASE.2025-09-07T16-13-09Z"
+MC_TAG="$REGISTRY_NS/mc:RELEASE.2025-08-13T08-35-41Z"
 
 PORT_SUFFIX=""
 [ "$CADDY_HTTPS_PORT" = 443 ] || PORT_SUFFIX=":${CADDY_HTTPS_PORT}"
 
 COMPOSE=(docker compose --project-directory "$DEPLOY" -f "$DEPLOY/docker-compose.prod.yml")
+# The merged CA bundle the app containers of the scratch stack trust (write_deploy_env +
+# trust_perimeter_ca): the image's bundle plus Caddy's local root. Rehearsal only.
+APP_CA_BUNDLE="$SCRATCH/ca/app-ca-bundle.crt"
 
 log()  { printf '→ rehearse: %s\n' "$*"; }
 warn() { printf '⚠ rehearse: %s\n' "$*" >&2; }
@@ -126,6 +151,21 @@ image_for() {
   esac
 }
 
+# The object store's images under the rehearsal registry name (10.6, BR-33). A `docker tag`
+# gives an image a NAME, never a repository DIGEST (digests are recorded by pull/push only), so
+# the production compose's `${REGISTRY}/trades/minio@sha256:…` reference can NOT resolve a
+# locally tagged copy — write_deploy_env below rewrites those two lines in the rehearsal's
+# scratch COPY of the compose to the tagged references. The committed compose is untouched.
+tag_object_store_images() {
+  for pair in "$MINIO_SRC|$MINIO_TAG" "$MC_SRC|$MC_TAG"; do
+    src="${pair%%|*}"; dst="${pair#*|}"
+    docker image inspect "$src" >/dev/null 2>&1 \
+      || die "cached object-store image $src not found — upstream no longer serves it (ADR-126); the rehearsal needs the developer's local cache"
+    docker tag "$src" "$dst"
+    log "tagged $src → $dst (rehearsal name; nothing is pushed)"
+  done
+}
+
 build_images() {
   for svc in $REHEARSE_SERVICES; do
     img="$(image_for "$svc")"
@@ -151,7 +191,7 @@ build_images() {
         ;;
       web)
         grep -qE '^FROM .* AS runtime' "$WORKSPACE/trades-front/Dockerfile" \
-          || die "trades-front/Dockerfile has no 'runtime' target yet (the Frontend Developer phase adds it) — run with REHEARSE_SERVICES=\"app media\" until it lands"
+          || die "trades-front/Dockerfile has no 'runtime' target yet — run with REHEARSE_SERVICES=\"app media\" until it lands"
         args=()
         while IFS= read -r line || [ -n "$line" ]; do
           case "$line" in ''|'#'*) continue ;; esac
@@ -229,17 +269,56 @@ generate_secrets() {
     grep -E '^# public key:' "$SECRETS/backup-age.key" | sed 's/^# public key: //' > "$SECRETS/backup-age.recipient"
     chmod 600 "$SECRETS/backup-age.key"
   fi
-  log "scratch secrets written under $SECRETS (gitignored)"
+  # The stage-1 basic-auth credential (BR-18/19): a per-run password and its bcrypt hash from
+  # the pinned Caddy image. The password is printed ONCE below for the browser walk; the hash
+  # goes into the scratch deploy/.env SINGLE-QUOTED (compose corrupts an unquoted `$`).
+  BASIC_AUTH_USER="partner"
+  BASIC_AUTH_PASSWORD="$(gen_hex 16)"
+  caddy_img="$(grep -oE 'image: caddy:[^[:space:]]+' "$DEPLOY_SRC/docker-compose.prod.yml" | head -1 | cut -d' ' -f2)"
+  BASIC_AUTH_HASH="$(docker run --rm "$caddy_img" caddy hash-password -p "$BASIC_AUTH_PASSWORD" 2>/dev/null)" \
+    || die "could not hash the rehearsal basic-auth password with $caddy_img"
+  printf 'BASIC_AUTH_USER=%s\nBASIC_AUTH_PASSWORD=%s\n' "$BASIC_AUTH_USER" "$BASIC_AUTH_PASSWORD" > "$SECRETS/basic-auth.env"
+  chmod 600 "$SECRETS/basic-auth.env"
+  log "scratch secrets written under $SECRETS (gitignored); the basic-auth password is in $SECRETS/basic-auth.env"
 }
 
 write_deploy_env() {
   mkdir -p "$DEPLOY"
   # a fresh copy of deploy/ so deploy/.env, the lock and the compose project live in scratch
-  for f in docker-compose.prod.yml Caddyfile deploy.sh backup-postgres.sh restore-drill.sh host-sentinel.sh; do
+  for f in docker-compose.prod.yml Caddyfile deploy.sh backup-postgres.sh restore-drill.sh host-sentinel.sh seed-synthetic.sh; do
     cp "$DEPLOY_SRC/$f" "$DEPLOY/$f"
   done
   rm -rf "$DEPLOY/postgres-init"; cp -R "$DEPLOY_SRC/postgres-init" "$DEPLOY/postgres-init"
-  chmod +x "$DEPLOY"/*.sh
+  rm -rf "$DEPLOY/agent-db"; cp -R "$DEPLOY_SRC/agent-db" "$DEPLOY/agent-db"
+  chmod +x "$DEPLOY"/*.sh "$DEPLOY"/agent-db/*.sh
+  # The object store BY TAG in the scratch copy only (see tag_object_store_images): the two
+  # `${REGISTRY:?…}/trades/<minio|mc>@sha256:<digest>` lines become `…/<name>:<release tag>`.
+  # awk, not sed -i (GNU and BSD disagree on its argument); the committed file is untouched.
+  awk -v minio="$MINIO_TAG" -v mc="$MC_TAG" '
+    /^[[:space:]]*image:[[:space:]]*\$\{REGISTRY[^}]*\}\/trades\/minio@sha256:/ { sub(/image:.*/, "image: " minio "   # rehearsal: tagged copy of the cached image (rehearse.sh)") }
+    /^[[:space:]]*image:[[:space:]]*\$\{REGISTRY[^}]*\}\/trades\/mc@sha256:/    { sub(/image:.*/, "image: " mc "   # rehearsal: tagged copy of the cached image (rehearse.sh)") }
+    { print }' "$DEPLOY_SRC/docker-compose.prod.yml" > "$DEPLOY/docker-compose.prod.yml"
+  grep -q "image: $MINIO_TAG" "$DEPLOY/docker-compose.prod.yml" || die "the rehearsal compose rewrite did not land (minio) — check the image: line shape in deploy/docker-compose.prod.yml"
+  grep -q "image: $MC_TAG" "$DEPLOY/docker-compose.prod.yml" || die "the rehearsal compose rewrite did not land (mc) — check the image: line shape in deploy/docker-compose.prod.yml"
+  # REHEARSAL-ONLY TRUST OF THE LOCAL CA (10.6 seed lane, SE-003 kept): the synthetic-data lane
+  # PUTs presigned uploads to https://storage.${DOMAIN} through the perimeter (`caddy`, see
+  # deploy/seed-synthetic.sh UPLOAD TARGET), and here that site is signed by Caddy's `tls
+  # internal` root, which the app image's CA bundle cannot know. Production trusts the public
+  # CA and needs nothing. So — in the SCRATCH COPY of the compose only — every container of the
+  # `x-app-common` anchor (app + workers + the one-off seed containers) mounts a MERGED bundle
+  # (the image's own /etc/ssl/certs/ca-certificates.crt + the exported root, written by
+  # trust_perimeter_ca after the perimeter boots) read-only OVER the image's bundle path.
+  # Verification is never switched off: an extra trusted root, nothing else. The committed
+  # compose is untouched; the bind source must exist before any app container starts.
+  awk -v bundle="$APP_CA_BUNDLE" '
+    /^x-app-common:/ { in_anchor = 1 }
+    in_anchor && /^[^[:space:]]/ && !/^x-app-common:/ { in_anchor = 0 }
+    { print }
+    in_anchor && /^[[:space:]]*-[[:space:]]*\$\{TRADES_SECRETS_DIR[^}]*\}\/files:\/run\/secrets\/files:ro/ {
+      print "    - " bundle ":/etc/ssl/certs/ca-certificates.crt:ro   # rehearsal: the image bundle + Caddy local root (rehearse.sh; verification stays ON)"
+    }' "$DEPLOY/docker-compose.prod.yml" > "$DEPLOY/docker-compose.prod.yml.tmp" && mv "$DEPLOY/docker-compose.prod.yml.tmp" "$DEPLOY/docker-compose.prod.yml"
+  [ "$(grep -c "$APP_CA_BUNDLE:/etc/ssl/certs/ca-certificates.crt:ro" "$DEPLOY/docker-compose.prod.yml")" = 1 ] \
+    || die "the rehearsal compose rewrite did not land (app CA bundle) — check the x-app-common volumes shape in deploy/docker-compose.prod.yml"
   {
     echo "DOMAIN=${DOMAIN}"
     echo "CADDY_TLS_ARG=internal"
@@ -247,6 +326,11 @@ write_deploy_env() {
     echo "CADDY_HTTPS_PORT=${CADDY_HTTPS_PORT}"
     echo "TRADES_SECRETS_DIR=${SECRETS}"
     echo "TRADES_PROD_SUBNET=${TRADES_PROD_SUBNET}"
+    echo "REGISTRY=${REGISTRY}"
+    echo "BASIC_AUTH_USER=${BASIC_AUTH_USER}"
+    # SINGLE-QUOTED (BR-19): compose interpolates an unquoted `$` and corrupts the hash.
+    echo "BASIC_AUTH_HASH='${BASIC_AUTH_HASH}'"
+    # No BACKUPS_BUCKET in the rehearsal: backup-postgres.sh needs REHEARSAL_NO_OFFHOST_COPY=1.
   } > "$DEPLOY/.env"
   # tags: every deployable starts as the unpromotable sentinel; deploy.sh pins each SHA
   for var in APP_TAG MEDIA_TAG WEB_TAG; do echo "${var}=bootstrap-pending" >> "$DEPLOY/.env"; done
@@ -262,6 +346,21 @@ boot_perimeter() {
     sleep 1
   done
   log "Caddy local CA root exported to $SCRATCH/ca/root.crt — curl trusts it via CURL_CA_BUNDLE; Chromium via --ignore-certificate-errors-spki-list=$(spki_hash)"
+  trust_perimeter_ca
+}
+# The merged CA bundle the scratch compose mounts over the app image's bundle path (see
+# write_deploy_env): the image's own bundle, verbatim, plus the root just exported. Rebuilt on
+# every `up` because `down -v` wipes caddy-data and the next boot mints a new local root.
+trust_perimeter_ca() {
+  app_img="$(image_for app)"
+  docker run --rm --entrypoint cat "$app_img" /etc/ssl/certs/ca-certificates.crt > "$APP_CA_BUNDLE.tmp" \
+    || die "could not read /etc/ssl/certs/ca-certificates.crt from $app_img (the Debian php image ships it there; adjust trust_perimeter_ca if the base image moved it)"
+  [ -s "$APP_CA_BUNDLE.tmp" ] || die "the app image's CA bundle came back empty"
+  printf '\n# --- rehearsal only: Caddy local CA root (tls internal) ---\n' >> "$APP_CA_BUNDLE.tmp"
+  cat "$SCRATCH/ca/root.crt" >> "$APP_CA_BUNDLE.tmp"
+  mv "$APP_CA_BUNDLE.tmp" "$APP_CA_BUNDLE"
+  chmod 0444 "$APP_CA_BUNDLE"
+  log "app-image CA bundle + Caddy root merged into $APP_CA_BUNDLE (mounted read-only by the scratch compose's app containers; rehearsal only)"
 }
 spki_hash() {
   docker run --rm -v "$SCRATCH/ca:/ca:ro" --entrypoint sh "$(image_for app)" -c \
@@ -270,12 +369,14 @@ spki_hash() {
 
 deploy_env_exports() {
   export CURL_CA_BUNDLE="$SCRATCH/ca/root.crt"
-  export SMOKE_CURL_EXTRA_ARGS="--resolve app.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve api.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve media.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve storage.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1"
+  export SMOKE_CURL_EXTRA_ARGS="--resolve app.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve api.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve media.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve storage.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve mail.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1"
   export BACKUP_DIR="$SCRATCH/backups"
   export LOG_ARCHIVE_DIR="$SCRATCH/log-archive"
   export DEPLOY_LOCK_DIR="$SCRATCH/deploy.lock"
   export AGE_RECIPIENT_FILE="$SECRETS/backup-age.recipient"
   export SKIP_PULL=1
+  # No S3 in the rehearsal: the inline DE-005 backup runs local-only, loudly (10.6, BR-28).
+  export REHEARSAL_NO_OFFHOST_COPY=1
 }
 
 promote_all() {
@@ -346,17 +447,26 @@ print_evidence_hints() {
 
 ✓ rehearse: stack up — project trades-prod, domain ${DOMAIN}${PORT_SUFFIX}, scratch $SCRATCH
 
-  Evidence commands (spec AC-1..AC-24 / deployment.md § First-deploy rehearsal):
+  Evidence commands (10.4 AC-1..AC-24 and 10.6's rehearsal rows / deployment.md § First-deploy rehearsal):
     export CURL_CA_BUNDLE=$SCRATCH/ca/root.crt
-    R="--resolve api.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve app.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve media.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve storage.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1"
-    curl -sSI \$R https://api.${DOMAIN}${PORT_SUFFIX}/api/health                              # headers as served (AC-14, AC-18)
-    curl -sS -o /dev/null -w '%{http_code}\n' \$R https://api.${DOMAIN}${PORT_SUFFIX}/api/v1/school-link/training-needs   # 401, never 404 (AC-6)
-    docker compose --project-directory $DEPLOY -f $DEPLOY/docker-compose.prod.yml ps        # every worker healthy (AC-4)
-    docker compose --project-directory $DEPLOY -f $DEPLOY/docker-compose.prod.yml exec caddy tail -n 5 /var/log/caddy/access.log   # LO-009 lines (AC-8)
-    BACKUP_DIR=$SCRATCH/backups AGE_RECIPIENT_FILE=$SECRETS/backup-age.recipient $DEPLOY/backup-postgres.sh          # dumps (AC-19)
-    BACKUP_DIR=$SCRATCH/backups $DEPLOY/restore-drill.sh $SECRETS/backup-age.key                                     # drill (AC-15)
-    SKIP_PULL=1 BACKUP_DIR=$SCRATCH/backups LOG_ARCHIVE_DIR=$SCRATCH/log-archive DEPLOY_LOCK_DIR=$SCRATCH/deploy.lock $DEPLOY/deploy.sh app <sha>   # AC-7 (refused without a fresh dump)
-  Browser (AC-9/AC-10/AC-21): Chromium with --host-resolver-rules="MAP *.${DOMAIN} 127.0.0.1" --ignore-certificate-errors-spki-list=$(spki_hash)
+    R="--resolve api.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve app.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve media.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve storage.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1 --resolve mail.${DOMAIN}:${CADDY_HTTPS_PORT}:127.0.0.1"
+    curl -sSI \$R https://api.${DOMAIN}${PORT_SUFFIX}/api/health                              # headers as served; answers without credentials (AC-5)
+    curl -sSI \$R https://app.${DOMAIN}${PORT_SUFFIX}/                                        # 401 + the floor + private, no-store + noindex (AC-3, AC-5)
+    curl -sSI \$R https://mail.${DOMAIN}${PORT_SUFFIX}/                                       # 401 as well (BR-25); with -u \$(cut -d= -f2 $SECRETS/basic-auth.env | paste -sd: -) the viewer (AC-7)
+    curl -sS -o /dev/null -w '%{http_code}\n' \$R https://api.${DOMAIN}${PORT_SUFFIX}/api/v1/school-link/training-needs   # 401, never 404 (AC-19)
+    docker compose --project-directory $DEPLOY -f $DEPLOY/docker-compose.prod.yml ps        # every service healthy, mailpit included
+    docker compose --project-directory $DEPLOY -f $DEPLOY/docker-compose.prod.yml exec caddy tail -n 5 /var/log/caddy/access.log   # LO-009 lines
+    REHEARSAL_NO_OFFHOST_COPY=1 BACKUP_DIR=$SCRATCH/backups AGE_RECIPIENT_FILE=$SECRETS/backup-age.recipient $DEPLOY/backup-postgres.sh   # local dumps (no S3 here)
+    BACKUP_DIR=$SCRATCH/backups $DEPLOY/restore-drill.sh $SECRETS/backup-age.key                                     # drill (AC-16's local half)
+    SKIP_PULL=1 REHEARSAL_NO_OFFHOST_COPY=1 BACKUP_DIR=$SCRATCH/backups LOG_ARCHIVE_DIR=$SCRATCH/log-archive DEPLOY_LOCK_DIR=$SCRATCH/deploy.lock $DEPLOY/deploy.sh app <sha>   # the gate without a fresh dump
+    SKIP_PULL=1 SKIP_BACKUP_GATE=1 BACKUP_DIR=$SCRATCH/backups LOG_ARCHIVE_DIR=$SCRATCH/log-archive DEPLOY_LOCK_DIR=$SCRATCH/deploy.lock $DEPLOY/deploy.sh app <sha>   # AC-23: REFUSED once identity.users has rows
+    (seed lane, AC-18/AC-22 — on the EMPTY database, once; uploads go through caddy, whose local root the app containers trust here via $APP_CA_BUNDLE)
+    umask 077 && printf 'SYNTHETIC_SEED_PASSWORD=%s\n' "\$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" > $SECRETS/synthetic-seed.env
+    COMPOSE_DIR=$DEPLOY SEED_PASSWORD_FILE=$SECRETS/synthetic-seed.env $DEPLOY/seed-synthetic.sh --confirm-production-stage-1
+    (agent-role lane, AC-14/TM-3 — after the migrations; re-run after any inventory change)
+    umask 077 && printf 'AI_READONLY_PASSWORD=%s\n' "\$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" > $SECRETS/ai-readonly.env
+    COMPOSE_DIR=$DEPLOY AI_READONLY_ENV_FILE=$SECRETS/ai-readonly.env $DEPLOY/agent-db/provision-agent-role.sh
+  Browser (AC-4/AC-21): Chromium with --host-resolver-rules="MAP *.${DOMAIN} 127.0.0.1" --ignore-certificate-errors-spki-list=$(spki_hash); basic auth: $SECRETS/basic-auth.env
   Tear down: $0 down
 EOF
 }
@@ -370,6 +480,7 @@ case "$CMD" in
     for r in trades-backend media-service; do [ -d "$WORKSPACE/$r" ] || die "sibling repo $WORKSPACE/$r not found"; done
     mkdir -p "$SCRATCH"
     build_images
+    tag_object_store_images
     generate_secrets
     write_deploy_env
     boot_perimeter

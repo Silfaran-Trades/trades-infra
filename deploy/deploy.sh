@@ -19,17 +19,22 @@
 #   1b. pre-migration backup gate (DE-005) for the two services whose container start runs
 #       migrations (app, media): refuses unless a dump newer than BACKUP_MAX_AGE_MINUTES exists,
 #       taking one inline via backup-postgres.sh when the newest is stale. `SKIP_BACKUP_GATE=1`
-#       is explicit and logged — legitimate only on a first boot with no data. Runs BEFORE the
-#       tag pin so a gate failure leaves deploy/.env untouched.
+#       is explicit and logged — and since 10.6 it is HONOURED ONLY when `identity.users` is
+#       missing or empty (the one legitimate bypass: the first `app` promotion on an empty
+#       database, BR-28 / AC-23); on a database with users it REFUSES and names the count. A
+#       bypass writes a line to $LOG_ARCHIVE_DIR/backup-gate-bypass.log and prints
+#       `BACKUP GATE SKIPPED (empty database)`, which scripts/promote.sh copies into the
+#       promotion record. Runs BEFORE the tag pin so a gate failure leaves deploy/.env untouched.
 #   2.  pins the new tag in deploy/.env; on a fresh host seeds missing sibling tags with an
 #       unpromotable sentinel (2b)
 #   2c. archives the OUTGOING container's log before the recreate (DE-007), redacted, and
 #       prunes the archive past LOG_ARCHIVE_RETENTION_DAYS (14 — BR-31, pii-inventory.md)
 #   3.  docker compose pull + up -d for THAT service only (`SKIP_PULL=1`, logged, lets the
 #       rehearsal promote locally-built images that were never pushed)
-#   3a. ensures the runtime set NOTHING depends on — the perimeter (`caddy`) and the Chat hub
-#       (`mercure`) — with `up -d --no-recreate` (started when absent or stopped, never touched
-#       when running) and gates `caddy` on its healthcheck on every promotion, `mercure` on `app`
+#   3a. ensures the runtime set NOTHING depends on — the perimeter (`caddy`), the Chat hub
+#       (`mercure`) and the stage-1 mail capture (`mailpit`) — with `up -d --no-recreate`
+#       (started when absent or stopped, never touched when running) and gates `caddy` on its
+#       healthcheck on every promotion, `mercure` and `mailpit` on `app`
 #   4.  readiness gate: polls /api/health inside the container (the SPA: its root) until healthy
 #       or 120 s — on failure prints the rollback command and exits 1
 #   4a. gates the promoted container on its DOCKER healthcheck too — the state `compose ps`, the
@@ -37,7 +42,10 @@
 #       (both supervisord consumers RUNNING). The promotion never returns on `starting`
 #   4b. for `app`: recreates the three workers on the SAME tag and gates each on its Docker
 #       healthcheck (PID-1 consumer, DE-003) — a crash-looping worker never ships green
-#   5.  smoke URLs through the real perimeter, then the route-map canary on the newest surface
+#   5.  smoke URLs through the real perimeter — for `web` the SPA host is behind basic auth
+#       (BR-18), so the smoke expects a 401 CARRYING the security-header floor's
+#       Content-Security-Policy (BR-20; no credential ever passes through an argument) —
+#       then the route-map canary on the newest surface
 #       (`GET /api/v1/school-link/training-needs` must answer 401, never 404 — DE-002)
 #   6.  prunes images unused for 7+ days (IA-011 — rollback re-pulls from the registry)
 #
@@ -45,7 +53,9 @@
 #   BACKUP_DIR, BACKUP_MAX_AGE_MINUTES, BACKUP_SCRIPT, LOG_ARCHIVE_DIR, LOG_ARCHIVE_RETENTION_DAYS,
 #   DEPLOY_LOCK_DIR, SKIP_BACKUP_GATE=1, SKIP_PULL=1, SMOKE_CURL_EXTRA_ARGS (e.g. `--resolve`
 #   entries for hostnames that do not resolve publicly), CURL_CA_BUNDLE (curl reads it itself —
-#   the rehearsal points it at Caddy's local root; verification is never switched off).
+#   the rehearsal points it at Caddy's local root; verification is never switched off),
+#   REHEARSAL_NO_OFFHOST_COPY=1 (passed through to the inline backup — rehearsal only).
+#   BACKUPS_BUCKET for the inline backup is read from deploy/.env (host state) and exported.
 
 set -euo pipefail
 
@@ -106,11 +116,67 @@ PORT_SUFFIX=""
 BACKUP_DIR="${BACKUP_DIR:-/srv/trades/backups}"
 BACKUP_MAX_AGE_MINUTES="${BACKUP_MAX_AGE_MINUTES:-60}"
 BACKUP_SCRIPT="${BACKUP_SCRIPT:-$DEPLOY_DIR/backup-postgres.sh}"
+LOG_ARCHIVE_DIR="${LOG_ARCHIVE_DIR:-/srv/trades/log-archive}"
+# The off-host destination of the inline backup (BR-28): host state in deploy/.env, exported
+# for backup-postgres.sh (which hard-stops without it outside the rehearsal).
+if [ -z "${BACKUPS_BUCKET:-}" ]; then
+  BACKUPS_BUCKET="$(grep -E '^BACKUPS_BUCKET=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d "\"'" || true)"
+fi
+export BACKUPS_BUCKET
 freshest_dump() { find "$BACKUP_DIR" -maxdepth 1 -name '*.dump.gz.age' -mmin "-${BACKUP_MAX_AGE_MINUTES}" 2>/dev/null | head -1; }
+
+# The bypass guard (10.6, AC-23 / TM-9): `identity.users` must be missing or empty. The genuine
+# first boot is "no postgres container AND no postgres data volume"; a container that is absent
+# while the named volume exists (a `docker compose down` keeps volumes) or that exists but is
+# stopped is STARTED and counted — a database with users must never pass, whatever its container
+# state. The count runs inside the container with its own POSTGRES_USER (no credential on the line).
+compose_project() {   # the project name compose resolves: COMPOSE_PROJECT_NAME, else the file's `name:`, else the directory
+  if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then printf '%s' "$COMPOSE_PROJECT_NAME"; return 0; fi
+  n="$(awk '/^name:[[:space:]]*/{sub(/^name:[[:space:]]*/, ""); gsub(/["'"'"']/, ""); print; exit}' "$DEPLOY_DIR/docker-compose.prod.yml" 2>/dev/null || true)"
+  if [ -n "$n" ]; then printf '%s' "$n"; else basename "$DEPLOY_DIR"; fi
+}
+postgres_volume() {   # the named data volume compose would attach to postgres, by compose's own labels (never a hard-coded name)
+  docker volume ls -q --filter "label=com.docker.compose.project=$(compose_project)" --filter "label=com.docker.compose.volume=postgres-data" 2>/dev/null
+}
+users_count() {   # prints an integer, `missing` (no container AND no volume, or no table / no database yet), or `unknown`
+  if [ -z "$("${COMPOSE[@]}" ps -aq postgres 2>/dev/null)" ]; then
+    vol="$(postgres_volume)" || { echo unknown; return 0; }
+    [ -n "$vol" ] || { echo missing; return 0; }
+    echo "→ deploy: no postgres container, but its data volume exists ($vol) — starting postgres to count identity.users" >&2
+  fi
+  "${COMPOSE[@]}" up -d postgres >/dev/null 2>&1 || { echo unknown; return 0; }
+  pg_deadline=$(( $(date +%s) + 90 ))
+  # shellcheck disable=SC2016  # the variables expand INSIDE the container's shell, by design
+  until "${COMPOSE[@]}" exec -T postgres sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$pg_deadline" ] || { echo unknown; return 0; }
+    sleep 3
+  done
+  # shellcheck disable=SC2016  # same: the container's own POSTGRES_USER, never a credential on this line
+  out="$("${COMPOSE[@]}" exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d trades_app -tAc "SELECT count(*) FROM identity.users"' 2>&1)" \
+    || { case "$out" in *"does not exist"*) echo missing ;; *) echo unknown ;; esac; return 0; }
+  printf '%s' "$out" | tr -d '[:space:]'
+}
+
 if [ "$SERVICE" = "web" ]; then
   echo "→ deploy: backup gate not applicable ($SERVICE runs no migrations)"
 elif [ "${SKIP_BACKUP_GATE:-0}" = "1" ]; then
-  echo "→ deploy: BACKUP GATE SKIPPED (SKIP_BACKUP_GATE=1) — acceptable only on a first boot with an empty database"
+  n_users="$(users_count)"
+  case "$n_users" in
+    missing|0)
+      echo "→ deploy: BACKUP GATE SKIPPED (empty database) — SKIP_BACKUP_GATE=1 honoured: identity.users is ${n_users} (first boot)"
+      mkdir -p "$LOG_ARCHIVE_DIR" 2>/dev/null || true
+      printf '%s service=%s sha=%s identity.users=%s\n' "$(date -u +%FT%TZ)" "$SERVICE" "$SHA" "$n_users" >> "$LOG_ARCHIVE_DIR/backup-gate-bypass.log" 2>/dev/null \
+        || echo "⚠ deploy: could not write $LOG_ARCHIVE_DIR/backup-gate-bypass.log (the bypass still happened — record it by hand)" >&2
+      ;;
+    unknown)
+      echo "✗ deploy: SKIP_BACKUP_GATE=1 REFUSED — could not count identity.users (postgres not reachable); the bypass is legitimate only on a provably empty database. Investigate, or run the gate normally." >&2
+      exit 1
+      ;;
+    *)
+      echo "✗ deploy: SKIP_BACKUP_GATE=1 REFUSED — identity.users holds ${n_users} row(s); the backup-gate bypass is legitimate only on an empty database (first boot). Run without SKIP_BACKUP_GATE so a fresh dump is taken (DE-005, AC-23)." >&2
+      exit 1
+      ;;
+  esac
 else
   # Dead-cron tripwire (IA-011): the inline top-up below MASKS a dead nightly cron.
   if [ -z "$(find "$BACKUP_DIR" -maxdepth 1 -name '*.dump.gz.age' -mmin -1560 2>/dev/null | head -1)" ]; then
@@ -155,7 +221,6 @@ grep -oE '\$\{[A-Z][A-Z0-9_]*_TAG:\?' "$DEPLOY_DIR/docker-compose.prod.yml" \
 done
 
 # --- 2c. archive the outgoing container's log BEFORE the recreate (DE-007) ----
-LOG_ARCHIVE_DIR="${LOG_ARCHIVE_DIR:-/srv/trades/log-archive}"
 LOG_ARCHIVE_RETENTION_DAYS="${LOG_ARCHIVE_RETENTION_DAYS:-14}"
 # The prune is expressed in MINUTES: `find -mtime +N` truncates the age to whole days and
 # matches only ages strictly greater than N, i.e. at least N+1 days — a "14-day" prune on
@@ -257,19 +322,21 @@ gate_healthy() {
   echo "→ deploy: $svc healthy"
 }
 
-# --- 3a. the runtime set nothing depends on: the perimeter and the hub ------------
+# --- 3a. the runtime set nothing depends on: the perimeter, the hub, the mail capture ----
 # `depends_on` brings postgres up with `app` and storage/storage-init/clamav up with `media`,
-# but NO service depends on `caddy` or `mercure` — so a first boot or a host rebuild that only
-# ran this script left the hub down (502 on api.{DOMAIN}/.well-known/mercure, rehearsal AC-23)
-# and, in production, no perimeter at all. `--no-recreate` is the whole contract: start them
-# when absent or stopped, NEVER touch a running one — a Caddyfile or mercure.env change is the
-# explicit DE-004 / rotation lane (`up -d caddy`; RUNBOOK.md § "Rotate a secret"), not a side
-# effect of promoting a service. `caddy` is gated on every promotion (step 5's smoke goes
-# through it); `mercure` is gated with `app` (its keys are app.env's twins, its host is api.).
-"${COMPOSE[@]}" up -d --no-recreate caddy mercure
+# but NO service depends on `caddy`, `mercure` or `mailpit` — so a first boot or a host rebuild
+# that only ran this script left the hub down (502 on api.{DOMAIN}/.well-known/mercure,
+# rehearsal AC-23) and, in production, no perimeter at all. `--no-recreate` is the whole
+# contract: start them when absent or stopped, NEVER touch a running one — a Caddyfile or
+# mercure.env change is the explicit DE-004 / rotation lane (`up -d caddy`; RUNBOOK.md
+# § "The two Caddy lanes"), not a side effect of promoting a service. `caddy` is gated on
+# every promotion (step 5's smoke goes through it); `mercure` and `mailpit` are gated with
+# `app` (the hub's keys are app.env's twins; the app's MAILER_DSN names mailpit, BR-25).
+"${COMPOSE[@]}" up -d --no-recreate caddy mercure mailpit
 gate_healthy caddy 90 || { echo "✗ deploy: the perimeter is not healthy — nothing behind it is reachable; investigate before retrying" >&2; exit 1; }
 if [ "$SERVICE" = "app" ]; then
   gate_healthy mercure 90 || { echo "✗ rollback with: ./deploy.sh app ${PREVIOUS:-<no previous tag>}" >&2; exit 1; }
+  gate_healthy mailpit 90 || { echo "✗ deploy: the stage-1 mail capture is not healthy — every message the app sends would be lost (BR-25); investigate before retrying" >&2; exit 1; }
 fi
 
 # --- 4. readiness gate -----------------------------------------------------------
@@ -322,10 +389,26 @@ smoke() {
     || { echo "✗ deploy: smoke check failed: $url" >&2; exit 1; }
   echo "→ deploy: smoke OK $url"
 }
+# The SPA host is behind basic auth in stage 1 (BR-18): the smoke expects the 401 CHALLENGE
+# carrying the proxy's security-header floor — a Content-Security-Policy on a response the
+# proxy generated itself (BR-20, AC-3). No credential is used: the proof that the SPA is
+# served lies behind the challenge, which the partner's browser passes and the readiness
+# probe (step 4, inside the container) already asserted. Headers are read AS SERVED.
+smoke_basic_auth_challenge() {
+  url="$1"
+  hdrs="$(curl -sS -D - -o /dev/null --max-time 15 ${CURL_EXTRA[@]+"${CURL_EXTRA[@]}"} "$url" 2>/dev/null)" \
+    || { echo "✗ deploy: smoke check failed (no response): $url" >&2; exit 1; }
+  status="$(printf '%s' "$hdrs" | head -1 | awk '{print $2}')"
+  [ "$status" = 401 ] || { echo "✗ deploy: smoke check failed: $url answered HTTP ${status:-?}, expected the 401 basic-auth challenge (BR-18)" >&2; exit 1; }
+  printf '%s' "$hdrs" | grep -qi '^www-authenticate: *basic' || { echo "✗ deploy: smoke check failed: $url 401 carries no WWW-Authenticate: Basic challenge" >&2; exit 1; }
+  printf '%s' "$hdrs" | grep -qi '^content-security-policy:' || { echo "✗ deploy: smoke check failed: the 401 of $url carries NO Content-Security-Policy — the proxy's security-header floor is missing from the error lane (BR-20)" >&2; exit 1; }
+  printf '%s' "$hdrs" | grep -qi '^cache-control: *private, no-store' || { echo "✗ deploy: smoke check failed: the 401 of $url is not Cache-Control: private, no-store (AS-028)" >&2; exit 1; }
+  echo "→ deploy: smoke OK $url (401 challenge with the security-header floor)"
+}
 case "$SERVICE" in
   app)   smoke "https://api.${DOMAIN}${PORT_SUFFIX}/api/health" ;;
   media) smoke "https://media.${DOMAIN}${PORT_SUFFIX}/api/health" ;;
-  web)   smoke "https://app.${DOMAIN}${PORT_SUFFIX}/" ;;
+  web)   smoke_basic_auth_challenge "https://app.${DOMAIN}${PORT_SUFFIX}/" ;;
 esac
 
 # --- 5b. route-map canary (DE-002) — the NEWEST surface must RESOLVE, never 404 -------

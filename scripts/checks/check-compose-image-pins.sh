@@ -87,6 +87,13 @@ for f in "${files[@]}"; do
     # The patterns below match a literal `${` — no expansion intended.
     # shellcheck disable=SC2016
     case "$value" in
+      '${'*'/'*':${'*)
+        # `${REGISTRY}/trades/<name>:${X_TAG:?}` — the registry HOST is interpolated (deploy/.env),
+        # the TAG is the promoted git SHA (10.6, BR-23): the SHA-tagged deployable of
+        # deployment.md § Images, built from a digest-pinned Dockerfile by scripts/promote.sh.
+        printf "  · %s:%s  %s — SHA-tagged deployable (registry host from deploy/.env, promoted by git SHA)\n" "$f" "$ln" "$value"
+        continue
+        ;;
       '${'*)
         printf "  ~ %s:%s  %s — pure interpolation; the pin lives where the variable is set, cannot be verified here\n" "$f" "$ln" "$value"
         continue
