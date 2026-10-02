@@ -1,6 +1,7 @@
-# Trades — production compose, single-host baseline (production-packaging-promotion-lane, BR-18).
+# Trades — production compose, single-host baseline (production-packaging-promotion-lane, BR-18;
+# adapted by production-infrastructure-first-deploy, 10.6 — ADR-124/125/126).
 # Derived from ai-standards/templates/deploy/docker-compose.prod.yml.template.
-# Authoritative rules: ai-standards/standards/deployment.md; perimeter: ADR-120.
+# Authoritative rules: ai-standards/standards/deployment.md; perimeter: ADR-120 (amended by 10.6).
 #
 # WHAT RUNS (the runtime set, RUNBOOK.md § "The runtime set"):
 #   caddy               the perimeter — the ONLY service publishing host ports (80/443)
@@ -11,13 +12,21 @@
 #   mercure             the Chat SSE hub, served at api.{DOMAIN}/.well-known/mercure
 #   media               media-service (php-fpm + nginx + its two workers under supervisord)
 #   clamav              the antivirus daemon the media scan worker calls
-#   storage / storage-init   MinIO (ADR-021 still open) + the one-shot bucket bootstrap
+#   storage / storage-init   MinIO (ADR-126: the last community images, mirrored into this
+#                       project's ECR) + the one-shot bucket bootstrap
+#   mailpit             stage-1 mail capture (BR-25): every message the platform sends lands
+#                       here and nothing leaves the host; viewer at mail.{DOMAIN} behind basic auth
 #   postgres            PostgreSQL 18 + PostGIS — one instance, `trades_app` + `media`
 #
 # INTERPOLATION comes from `deploy/.env` (host state, gitignored; documented in
-# rehearsal/templates/deploy.env.template): APP_TAG / MEDIA_TAG / WEB_TAG (full git SHAs,
-# maintained by deploy.sh — never by hand, never `latest`), DOMAIN, CADDY_TLS_ARG, and
-# optionally TRADES_SECRETS_DIR (default /srv/trades/secrets) + TRADES_PROD_SUBNET.
+# rehearsal/templates/deploy.env.template): REGISTRY (the ECR registry host, `terraform
+# output registry` — BR-23), APP_TAG / MEDIA_TAG / WEB_TAG (full git SHAs, maintained by
+# deploy.sh — never by hand, never `latest`), DOMAIN (`terraform output public_hostname` in
+# stage 1 — BR-15), CADDY_TLS_ARG (the ACME e-mail in production, `internal` in the
+# rehearsal), BASIC_AUTH_USER / BASIC_AUTH_HASH (the stage-1 perimeter credential, BR-18/19 —
+# the hash SINGLE-QUOTED, compose silently corrupts an unquoted `$`), BACKUPS_BUCKET (read by
+# deploy.sh / backup-postgres.sh, not by compose), and optionally TRADES_SECRETS_DIR
+# (default /srv/trades/secrets) + TRADES_PROD_SUBNET.
 #
 # SECRETS never live in this file: `env_file:` points at the host's per-service env files
 # (deployment.md § "Secrets in production"; chmod 600, gitignored) and file-shaped secrets
@@ -33,9 +42,13 @@
 # this subnet (BR-30) — the backends trust `X-Forwarded-*` only from it, and Caddy is the
 # only thing on it that speaks to the internet.
 #
-# Images: the three deployables are SHA-tagged (built by the CD job / the rehearsal from
-# digest-pinned Dockerfiles); every infrastructure image below is digest-pinned (BR-2,
+# Images: the three deployables are SHA-tagged `${REGISTRY}/trades/<name>:<sha>` — built on
+# the developer's Mac by scripts/promote.sh from a pristine archive of the commit, scanned,
+# pushed to ECR (IMMUTABLE tags, ADR-125) and pulled by the host through its instance profile
+# (no registry credential on the host). The object store runs the mirrored images from the
+# same registry BY DIGEST (BR-33); every other infrastructure image is digest-pinned (BR-2,
 # `make image-pins`). Re-resolve with `docker buildx imagetools inspect <image>:<tag>`.
+# No image reference names quay.io or ghcr.io (AC-24).
 
 name: trades-prod
 
@@ -55,6 +68,9 @@ volumes:
   caddy-config:
   # The perimeter's request log (LO-009 / DE-007): a named volume outlives every recreate.
   caddy-logs:
+  # The captured-mail store (BR-25): bounded by MP_MAX_MESSAGES / MP_MAX_AGE below; an
+  # inventoried personal-data store (pii-inventory.md `channel:captured-mail`), ends at 10.9.
+  mailpit-data:
 
 x-service-defaults: &service-defaults
   restart: unless-stopped
@@ -71,7 +87,7 @@ x-service-defaults: &service-defaults
 # env file, the same read-only posture, the same secret files.
 x-app-common: &app-common
   <<: *service-defaults
-  image: ghcr.io/silfaran-trades/trades-backend:${APP_TAG:?run deploy.sh}
+  image: ${REGISTRY:?set REGISTRY in deploy/.env}/trades/trades-backend:${APP_TAG:?run deploy.sh}
   env_file:
     - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/app.env
   read_only: true
@@ -100,10 +116,18 @@ services:
       - "${CADDY_HTTP_PORT:-80}:80"
       - "${CADDY_HTTPS_PORT:-443}:443"
     environment:
-      # Substituted into the Caddyfile at parse time ({$DOMAIN}, {$CADDY_TLS_ARG}).
+      # Substituted into the Caddyfile at parse time ({$DOMAIN}, {$CADDY_TLS_ARG},
+      # {$BASIC_AUTH_USER}, {$BASIC_AUTH_HASH}).
       DOMAIN: ${DOMAIN:?set DOMAIN in deploy/.env}
-      # `tls <email>` (ACME, production) or `tls internal` (the rehearsal's local CA).
+      # `tls <email>`: the ACME registration e-mail in production (Let's Encrypt, with
+      # Caddy's ZeroSSL fallback enabled by the e-mail — BR-16); `internal` in the
+      # rehearsal (Caddy's local CA; verification is never switched off).
       CADDY_TLS_ARG: ${CADDY_TLS_ARG:?set CADDY_TLS_ARG in deploy/.env}
+      # The stage-1 perimeter credential (BR-18): basic auth on app. and mail. only. The
+      # hash comes from `caddy hash-password` and MUST be single-quoted in deploy/.env
+      # (BR-19; verify with `docker compose config` before the first start).
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:?set BASIC_AUTH_USER in deploy/.env}
+      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH:?set BASIC_AUTH_HASH in deploy/.env (single-quoted)}
     read_only: true
     tmpfs:
       - /tmp:size=64m
@@ -215,7 +239,7 @@ services:
   # ---- media-service: php-fpm + nginx + scan/process workers under supervisord -------------
   media:
     <<: *service-defaults
-    image: ghcr.io/silfaran-trades/media-service:${MEDIA_TAG:?run deploy.sh}
+    image: ${REGISTRY:?set REGISTRY in deploy/.env}/trades/media-service:${MEDIA_TAG:?run deploy.sh}
     env_file:
       - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/media.env
     environment:
@@ -258,12 +282,19 @@ services:
       retries: 5
       start_period: 180s   # freshclam pulls the initial signature DB on first boot
 
-  # ---- object storage (MinIO today; ADR-021 open) — public endpoint storage.{DOMAIN} --------
+  # ---- object storage (MinIO, ADR-126) — public endpoint storage.{DOMAIN} ------------------
+  # The upstream images no longer exist (MinIO's community edition stopped publishing in
+  # October 2025 and both 10.4 digests return "no such manifest" on quay.io); stage 1 runs
+  # the developer's cached copies, pushed ONCE into this project's ECR by
+  # scripts/mirror-object-store-images.sh and referenced here BY DIGEST (BR-33, AC-24).
+  # The digests below are the ones 10.4 verified upstream (RELEASE.2025-09-07T16-13-09Z and
+  # RELEASE.2025-08-13T08-35-41Z); the mirror script prints the digest ECR reports after the
+  # push, and Phase 7 step 6 pins THAT value here in one PR before the first host sync —
+  # until then the rehearsal substitutes its locally-tagged copies (rehearsal/rehearse.sh).
+  # Synthetic media only; native S3 before the first real data (BR-29, BR-33).
   storage:
     <<: *service-defaults
-    # Digest provenance: the manifest-list digest Docker recorded for this tag at the
-    # 2026-08-28 pull (quay.io refused anonymous manifest queries on 2026-09-25).
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    image: ${REGISTRY:?set REGISTRY in deploy/.env}/trades/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     command: ["server", "/data", "--console-address", ":9001"]
     env_file:
       - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/storage.env   # MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
@@ -280,7 +311,7 @@ services:
 
   # One-shot bucket bootstrap (idempotent). `media` waits for it to complete successfully.
   storage-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    image: ${REGISTRY:?set REGISTRY in deploy/.env}/trades/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     networks: [prod-network]
     restart: "no"
     env_file:
@@ -305,6 +336,31 @@ services:
         mc cp /tmp/.bootstrap-probe local/media-public/.bootstrap-probe
         echo 'media-public (anonymous download) + media-private buckets ready'
 
+  # ---- stage-1 mail capture (BR-25, AC-7) — viewer at mail.{DOMAIN} behind basic auth --------
+  # The development compose's existing pin, reused. SMTP (1025) and the viewer (8025) are
+  # reachable on the internal network only — no published port; app.env's MAILER_DSN is
+  # `smtp://mailpit:1025` and nothing delivers to the internet. The store is BOUNDED
+  # (500 messages / 14 days — pii-inventory.md `channel:captured-mail`) and lives in its own
+  # named volume. Nothing depends on it, so deploy.sh ensures it like the perimeter and the
+  # hub (`up -d --no-recreate`) and gates it with `app`. Ends at 10.9 (SES with the domain).
+  mailpit:
+    <<: *service-defaults
+    image: axllent/mailpit:v1.31.2@sha256:74d609a42ec279aa63c6b4622a6fa9b5408d1ad5b1d76a1c4be40a265ce0863d
+    environment:
+      MP_MAX_MESSAGES: "500"
+      MP_MAX_AGE: "14d"
+      MP_DATABASE: /data/mailpit.db
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    volumes:
+      - mailpit-data:/data
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
   # ---- PostgreSQL 18 + PostGIS — one instance, `trades_app` + `media` ------------------------
   postgres:
     <<: *service-defaults
@@ -328,7 +384,7 @@ services:
   # ---- the SPA: a static-file image (vite build + unprivileged nginx on 8080) ---------------
   web:
     <<: *service-defaults
-    image: ghcr.io/silfaran-trades/trades-front:${WEB_TAG:?run deploy.sh}
+    image: ${REGISTRY:?set REGISTRY in deploy/.env}/trades/trades-front:${WEB_TAG:?run deploy.sh}
     # No env_file: VITE_* are build-time, and secrets are never safe there anyway. The image's
     # nginx emits the SPA's own security headers (CSP, HSTS, COOP/CORP — BR-15a) and logs
     # with the lo009 format (LO-009).

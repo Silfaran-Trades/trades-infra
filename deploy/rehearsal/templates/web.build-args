@@ -16,3 +16,6 @@ VITE_FIREBASE_MESSAGING_SENDER_ID=000000000000
 VITE_FIREBASE_APP_ID=1:000000000000:web:rehearsal
 VITE_FIREBASE_VAPID_KEY=rehearsal-vapid-key
 VITE_STRIPE_PUBLISHABLE_KEY=pk_test_rehearsal
+# Google sign-in on by default (BR-32, the ADR-107 amendment) — the Tester's second rehearsal
+# build sets `false` to prove the button and its divider disappear (AC-21).
+VITE_GOOGLE_SIGN_IN_ENABLED=true
