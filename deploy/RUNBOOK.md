@@ -126,8 +126,10 @@ stays.
 ### The basic-auth credential (BR-19)
 
 The username and the password **hash** live only in the host's `deploy/.env`
-(`BASIC_AUTH_USER`, `BASIC_AUTH_HASH`); the password itself lives in the developer's password
-manager and is handed to the partner out of band. Generate the hash in the pinned image, and
+(`BASIC_AUTH_USER`, `BASIC_AUTH_HASH`); the password itself is the SSM SecureString
+`/trades/production/operator/web-login` (user + password; host and agent are denied the
+`operator/` path) and is handed to the partner out of band. **Forgot it?** From `trades-infra/`:
+`make web-login`. The backup restore identity sits beside it, `/trades/production/operator/backup-age-key`. Generate the hash in the pinned image, and
 **single-quote it**: Compose interpolates an unquoted `$` and silently corrupts a bcrypt hash.
 
 ```bash
@@ -327,7 +329,7 @@ pilot, then quarterly. Record each drill's output line here:
 
 | Date | Dump restored | Result |
 |---|---|---|
-| _(first drill: after the first night following the first promotion — Phase 7 step 12)_ | | |
+| 2026-10-03 | `trades_app-20261003-070229` + `media-20261003-070229`, fetched from the off-host copy on the Mac (operator profile) | OK — every schema read (e.g. `audit.audit_log`=163, `company.companies`=4, `demand.candidacies`=16); first run failed on the `ai_readonly` GRANTs until `--no-privileges` |
 
 ## Restore the database
 
@@ -336,9 +338,10 @@ is the restore point:
 
 1. Drill-tested procedure: `restore-drill.sh` restores the newest dump of `trades_app` and
    `media` into a scratch database and reads every schema — verify there first, then restore into
-   the real database the same way (drop the real target only on a deliberate, spelled-out
-   decision; `deploy.sh` and every worker stopped first).
-2. The age private key is **off-host by design** — the developer's password manager.
+   the real database the same way — `pg_restore --no-owner --no-privileges` (drop the real
+   target only on a deliberate, spelled-out decision; `deploy.sh` and every worker stopped first).
+2. The age private key is **off-host by design** — the SSM SecureString
+   `/trades/production/operator/backup-age-key` (host and agent denied the path).
 3. Posture and sequencing: `deployment.md` § "Backups and the restore drill" +
    `data-migrations.md` § "Rollback posture". **A restore that rebuilds the Postgres volume loses
    the `ai_readonly` role and the `mask` schema** — re-run the agent-role lane afterwards.

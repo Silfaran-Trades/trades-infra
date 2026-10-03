@@ -22,7 +22,7 @@
 #
 # Rendered by templatefile() in main.tf — ${project}/${environment}/${region}/
 # ${registry_host}/${host_alerts_topic_arn}/${swap_gb} are Terraform template
-# variables, NOT shell variables. Every shell `$` below is escaped as `$$`.
+# variables, NOT shell variables. A shell dollar-brace is escaped as a doubled dollar before the brace; a bare `$VAR` or `$(` is left as is - templatefile interpolates only dollar-brace, and `$$` is NOT an escape (it reaches the host literally).
 #
 # HARD RULE: no secrets in this file — user-data is readable from the instance
 # metadata surface. Secrets are fetched at deploy time from the parameter store
@@ -142,16 +142,16 @@ export AWS_PAGER=""
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 PREFIX="/${project}/${environment}/env"
 DEST="/srv/${project}/secrets"
-aws ssm get-parameters-by-path --region "${region}" --path "$$PREFIX" \
+aws ssm get-parameters-by-path --region "${region}" --path "$PREFIX" \
   --with-decryption --query 'Parameters[].Name' --output text | tr '\t' '\n' \
 | while read -r name; do
-  [ -n "$$name" ] || continue
-  svc="$$(basename "$$name")"
-  aws ssm get-parameter --region "${region}" --name "$$name" --with-decryption \
-    --query 'Parameter.Value' --output text | cat > "$$DEST/$$svc.env"
-  chmod 600 "$$DEST/$$svc.env"
-  chown deploy:deploy "$$DEST/$$svc.env"
-  echo "→ fetch-secrets: wrote $$DEST/$$svc.env"
+  [ -n "$name" ] || continue
+  svc="$(basename "$name")"
+  aws ssm get-parameter --region "${region}" --name "$name" --with-decryption \
+    --query 'Parameter.Value' --output text | cat > "$DEST/$svc.env"
+  chmod 600 "$DEST/$svc.env"
+  chown deploy:deploy "$DEST/$svc.env"
+  echo "→ fetch-secrets: wrote $DEST/$svc.env"
 done
 FETCH
 chmod 750 /srv/${project}/fetch-secrets.sh
@@ -166,13 +166,13 @@ set -euo pipefail
 export AWS_PAGER=""
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 aws sns publish --region "${region}" --topic-arn "${host_alerts_topic_arn}" \
-  --subject "[${project} sentinel] host alert" --message "$$(cat)" | cat >/dev/null
+  --subject "[${project} sentinel] host alert" --message "$(cat)" | cat >/dev/null
 NOTIFY
 cat > /srv/${project}/sentinel-dlq-depth.sh <<'DLQ'
 #!/bin/bash
 set -euo pipefail
 # The app's Messenger table and its dead-letter queue (deploy/host-sentinel.sh header).
-docker exec ${project}-prod-postgres-1 sh -c 'psql -U "$$POSTGRES_USER" -d ${project}_app -tAc "SELECT count(*) FROM shared.messenger_messages WHERE queue_name = '"'"'failed'"'"'"'
+docker exec ${project}-prod-postgres-1 sh -c 'psql -U "$POSTGRES_USER" -d ${project}_app -tAc "SELECT count(*) FROM shared.messenger_messages WHERE queue_name = '"'"'failed'"'"'"'
 DLQ
 chmod 750 /srv/${project}/sentinel-notify.sh /srv/${project}/sentinel-dlq-depth.sh
 chown deploy:deploy /srv/${project}/sentinel-notify.sh /srv/${project}/sentinel-dlq-depth.sh

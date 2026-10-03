@@ -20,7 +20,7 @@
 #      retention prune can never remove the file mid-drill (spec § Edge Cases)
 #   2. starts a THROWAWAY PostGIS container (the pinned production image — a dump restores
 #      forward, never backward), never the production one
-#   3. decrypts → gunzips → pg_restores into scratch_restore with --no-owner
+#   3. decrypts → gunzips → pg_restores into scratch_restore with --no-owner --no-privileges
 #   4. runs ONE READ PER SCHEMA: every non-system schema the restored database lists in
 #      pg_namespace (the modular monolith's schema-per-bundle layout), one count per schema
 #      from its first table — so a bundle whose schema silently did not restore is a red line
@@ -83,8 +83,11 @@ for db in "${DATABASES[@]}"; do
   # --- 2..3. decrypt → restore into a fresh scratch database ------------------
   docker exec "$CONTAINER" psql -U postgres -q \
     -c "DROP DATABASE IF EXISTS scratch_restore" -c "CREATE DATABASE scratch_restore"
+  # --no-privileges: a dump carries the GRANTs to ai_readonly (the agent lane), but roles are
+  # cluster-wide and never travel in a dump — on a target without that role every GRANT errors
+  # and pg_restore exits non-zero. Privileges are re-created by the agent-role lane.
   age -d -i "$AGE_KEY" "$dump" | gunzip \
-    | docker exec -i "$CONTAINER" pg_restore -U postgres -d scratch_restore --no-owner
+    | docker exec -i "$CONTAINER" pg_restore -U postgres -d scratch_restore --no-owner --no-privileges
   echo "→ drill: $db restored"
 
   # --- 4. one read per schema -------------------------------------------------
