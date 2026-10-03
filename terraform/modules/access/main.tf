@@ -267,7 +267,7 @@ resource "aws_iam_policy" "boundary" {
 # --- The operator role (BR-4) — the `trades-prod` profile ------------------------
 resource "aws_iam_role" "operator" {
   name                 = "${var.project}-${var.environment}-operator"
-  description          = "The developer's production lane (plan, apply after the first, image push, promotion, host sync, restore drill, promotion records) — assumed from the Identity Center ${var.identity_center_permission_set} session; never a static key (SC-012)."
+  description          = "The developer's production lane (plan, apply after the first, image push, promotion, host sync, restore drill, promotion records) - assumed from the Identity Center ${var.identity_center_permission_set} session; never a static key (SC-012)."
   assume_role_policy   = local.trust_policy
   max_session_duration = 3600
   permissions_boundary = local.boundary_arn

@@ -100,7 +100,7 @@ data "aws_ami" "ubuntu" {
 
 resource "aws_iam_role" "host" {
   name                 = "${var.project}-${var.environment}-host"
-  description          = "The host's instance profile — its ONLY credential: SSM, its own parameter path, the scoped ECR read, put-only backups, the alerts topic (BR-6)."
+  description          = "The host's instance profile - its ONLY credential: SSM, its own parameter path, the scoped ECR read, put-only backups, the alerts topic (BR-6)."
   permissions_boundary = var.permissions_boundary_arn
   tags                 = local.tags
   assume_role_policy = jsonencode({

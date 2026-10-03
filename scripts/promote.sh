@@ -188,8 +188,9 @@ if [ "$LANE" = "new-image" ]; then
     web)
       ARGS_FILE="$INFRA_DIR/deploy/production/web.build-args"
       [ -f "$ARGS_FILE" ] || refuse "web-build-args" "$ARGS_FILE missing"
-      if grep -qE '@[A-Z_]+@' "$ARGS_FILE"; then
-        refuse "web-build-args" "$ARGS_FILE still carries an unfilled placeholder ($(grep -oE '@[A-Z_]+@' "$ARGS_FILE" | sort -u | paste -sd, -)) — fill it from the apply outputs and the Google console check (Phase 7 step 6) and commit it first"
+      # value lines only — the header comment names the placeholders it documents
+      if grep -vE '^[[:space:]]*#' "$ARGS_FILE" | grep -qE '@[A-Z_]+@'; then
+        refuse "web-build-args" "$ARGS_FILE still carries an unfilled placeholder ($(grep -vE '^[[:space:]]*#' "$ARGS_FILE" | grep -oE '@[A-Z_]+@' | sort -u | paste -sd, -)) — fill it from the apply outputs and the Google console check (Phase 7 step 6) and commit it first"
       fi
       while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|'#'*) continue ;; esac

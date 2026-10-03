@@ -57,7 +57,7 @@ resource "aws_sns_topic_subscription" "email" {
 # metrics must alarm, not stay green.
 resource "aws_cloudwatch_metric_alarm" "status_check" {
   alarm_name          = "${var.project}-${var.environment}-status-check-failed"
-  alarm_description   = "EC2 status check failing — the host itself is unhealthy (monitoring ladder Rung 1, DE-006)"
+  alarm_description   = "EC2 status check failing - the host itself is unhealthy (monitoring ladder Rung 1, DE-006)"
   namespace           = "AWS/EC2"
   metric_name         = "StatusCheckFailed"
   statistic           = "Maximum"
@@ -77,7 +77,7 @@ resource "aws_cloudwatch_metric_alarm" "status_check" {
 # before it becomes an outage.
 resource "aws_cloudwatch_metric_alarm" "cpu_credit_balance" {
   alarm_name          = "${var.project}-${var.environment}-cpu-credit-balance-low"
-  alarm_description   = "CPU credit balance below ${var.cpu_credit_balance_threshold} for 15 minutes — the host is throttling (BR-11 graduation signal)"
+  alarm_description   = "CPU credit balance below ${var.cpu_credit_balance_threshold} for 15 minutes - the host is throttling (BR-11 graduation signal)"
   namespace           = "AWS/EC2"
   metric_name         = "CPUCreditBalance"
   statistic           = "Minimum"

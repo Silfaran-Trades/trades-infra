@@ -107,14 +107,16 @@ terraform-fmt: _require-docker
 	docker run --rm -v "$(CURDIR)/terraform:/tf:ro" -w /tf $(TERRAFORM_IMAGE) fmt -check -recursive -diff
 	@echo "→ terraform fmt: OK"
 
+# TF_DATA_DIR keeps the gate off the operator's real `.terraform/` (S3 backend initialised at
+# Phase 7): a validate there reaches for backend credentials the gate never has.
 terraform-validate: _require-docker
 	@for env in $(TF_ENVIRONMENTS); do \
 	  echo "→ terraform validate: environments/$$env"; \
 	  docker run --rm -v "$(CURDIR)/terraform:/tf" -v "$(TF_PLUGIN_CACHE):/plugin-cache" \
-	    -e TF_PLUGIN_CACHE_DIR=/plugin-cache -e TF_IN_AUTOMATION=1 \
+	    -e TF_PLUGIN_CACHE_DIR=/plugin-cache -e TF_DATA_DIR=/plugin-cache/.validate-data/$$env -e TF_IN_AUTOMATION=1 \
 	    -w "/tf/environments/$$env" $(TERRAFORM_IMAGE) init -backend=false -input=false -lockfile=readonly >/dev/null || exit 1; \
 	  docker run --rm -v "$(CURDIR)/terraform:/tf" -v "$(TF_PLUGIN_CACHE):/plugin-cache" \
-	    -e TF_PLUGIN_CACHE_DIR=/plugin-cache -e TF_IN_AUTOMATION=1 \
+	    -e TF_PLUGIN_CACHE_DIR=/plugin-cache -e TF_DATA_DIR=/plugin-cache/.validate-data/$$env -e TF_IN_AUTOMATION=1 \
 	    -w "/tf/environments/$$env" $(TERRAFORM_IMAGE) validate || exit 1; \
 	done
 	@echo "→ terraform validate: OK ($(TF_ENVIRONMENTS))"

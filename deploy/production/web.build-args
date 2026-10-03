@@ -5,23 +5,23 @@
 # A VITE_* value is never a secret (invariants.md): everything here is a public URL, a public
 # identifier or a placeholder. NOTHING here is a credential.
 #
-# FILLED AT PHASE 7 STEP 6 (after the first apply, in one PR with the ECR digest pins, before
-# the first `web` promotion): replace @PUBLIC_HOSTNAME@ with `terraform output public_hostname`
-# and @GOOGLE_SIGN_IN_ENABLED@ with the Google console check's answer (`true` if the console
-# accepted the api. sslip.io redirect URI, else `false`). promote.sh REFUSES to build while any
-# `@…@` placeholder remains — a half-filled file must never become an image.
+# FILLED AT PHASE 7 STEP 6 (2026-10-03, with the ECR digest pins): the base hostname is
+# `terraform output public_hostname`; Google sign-in is OFF in stage 1 — the developer chose a
+# private, password-only stage (basic auth on app.), so no OAuth client was registered; it
+# returns with the real domain at 10.9. promote.sh REFUSES to build while any value line still
+# carries an `@…@` placeholder — a half-filled file must never become an image.
 #
 # Firebase and Stripe: non-empty `stage1-disabled` placeholders — push and payments are off in
 # stage 1 (BR-34), and trades-front's assert-build-env refuses an EMPTY value, never a
 # placeholder. Changing any value means rebuilding and re-promoting the SPA image: the CSP
 # hash and every origin are properties of the build (BR-12 of 10.4).
 
-VITE_API_URL=https://api.@PUBLIC_HOSTNAME@/api
-VITE_MEDIA_API_URL=https://media.@PUBLIC_HOSTNAME@/api
-VITE_MERCURE_HUB_URL=https://api.@PUBLIC_HOSTNAME@/.well-known/mercure
-VITE_SITE_URL=https://app.@PUBLIC_HOSTNAME@
+VITE_API_URL=https://api.15-216-165-184.sslip.io/api
+VITE_MEDIA_API_URL=https://media.15-216-165-184.sslip.io/api
+VITE_MERCURE_HUB_URL=https://api.15-216-165-184.sslip.io/.well-known/mercure
+VITE_SITE_URL=https://app.15-216-165-184.sslip.io
 VITE_PARTNER_CONTACT_EMAIL=partners@redprofesionales.example
-VITE_GOOGLE_SIGN_IN_ENABLED=@GOOGLE_SIGN_IN_ENABLED@
+VITE_GOOGLE_SIGN_IN_ENABLED=false
 VITE_FIREBASE_API_KEY=stage1-disabled
 VITE_FIREBASE_AUTH_DOMAIN=stage1-disabled
 VITE_FIREBASE_PROJECT_ID=stage1-disabled
