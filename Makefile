@@ -240,8 +240,8 @@ infra-up:
 infra-down:
 	docker compose down
 
-# The stage-1 web login (basic auth on app.): kept in SSM, never in a password manager or a
-# repository; readable by the owner/operator only (host and agent are denied the path).
-# Needs a live session: `aws sso login --profile trades-admin` first if it has expired.
+# The stage-1 logins, kept in SSM (never a password manager or a repository; host and agent
+# are denied the operator/ path): the browser's basic auth on app., the seeded demo accounts,
+# the owner's platform_admin. Needs a live session (`aws sso login --profile trades-admin`).
 web-login:
-	@aws ssm get-parameter --profile trades-prod --region eu-south-2 --name /trades/production/operator/web-login --with-decryption --query Parameter.Value --output text
+	@for p in web-login demo-users my-admin; do echo "== $$p"; aws ssm get-parameter --profile trades-prod --region eu-south-2 --name /trades/production/operator/$$p --with-decryption --query Parameter.Value --output text 2>/dev/null || echo "(not set yet)"; done
