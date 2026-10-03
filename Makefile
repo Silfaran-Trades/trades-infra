@@ -22,7 +22,7 @@
 #   make dast-high-check REPORT=… URL=…              — the High backstop alone, over a given report
 #   make infra-up / infra-down — the shared DEV stack (normally driven from ai-standards)
 
-.PHONY: quality shellcheck compose-config caddy-adapt actionlint image-pins gitleaks dast-baseline dast-high-check dast-high-selftest terraform-fmt terraform-validate tf-plan-check tf-plan-check-selftest mask-manifest mask-manifest-check rehearse rehearse-down infra-up infra-down _require-docker _security-reports-dir
+.PHONY: quality shellcheck compose-config caddy-adapt actionlint image-pins gitleaks dast-baseline dast-high-check dast-high-selftest terraform-fmt terraform-validate tf-plan-check tf-plan-check-selftest mask-manifest mask-manifest-check rehearse rehearse-down infra-up infra-down web-login _require-docker _security-reports-dir
 
 SHELLCHECK_IMAGE ?= koalaman/shellcheck-alpine:v0.11.0@sha256:9955be09ea7f0dbf7ae942ac1f2094355bb30d96fffba0ec09f5432207544002
 ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
@@ -239,3 +239,9 @@ infra-up:
 
 infra-down:
 	docker compose down
+
+# The stage-1 web login (basic auth on app.): kept in SSM, never in a password manager or a
+# repository; readable by the owner/operator only (host and agent are denied the path).
+# Needs a live session: `aws sso login --profile trades-admin` first if it has expired.
+web-login:
+	@aws ssm get-parameter --profile trades-prod --region eu-south-2 --name /trades/production/operator/web-login --with-decryption --query Parameter.Value --output text

@@ -126,8 +126,10 @@ stays.
 ### The basic-auth credential (BR-19)
 
 The username and the password **hash** live only in the host's `deploy/.env`
-(`BASIC_AUTH_USER`, `BASIC_AUTH_HASH`); the password itself lives in the developer's password
-manager and is handed to the partner out of band. Generate the hash in the pinned image, and
+(`BASIC_AUTH_USER`, `BASIC_AUTH_HASH`); the password itself is the SSM SecureString
+`/trades/production/operator/web-login` (user + password; host and agent are denied the
+`operator/` path) and is handed to the partner out of band. **Forgot it?** From `trades-infra/`:
+`make web-login`. The backup restore identity sits beside it, `/trades/production/operator/backup-age-key`. Generate the hash in the pinned image, and
 **single-quote it**: Compose interpolates an unquoted `$` and silently corrupts a bcrypt hash.
 
 ```bash
