@@ -137,9 +137,15 @@
 # non-HTML precedent). `?` = set only where the header is absent — an upstream header
 # always wins; on normal upstream traffic this is a no-op by construction (every
 # upstream emits the full set), on a 401 / 502 / 503 it is the only writer.
+# `form-action` and `base-uri` never fall back to default-src, so the deny policy names them
+# (ZAP 10055 on the first production DAST). The two deletions strip the stack fingerprint
+# (`X-Powered-By: PHP/x.y.z` from the backend image, `Server` from nginx / Caddy) on every
+# site; a `-Field` deletion is deferred by Caddy, so it also reaches upstream responses.
 (security_floor) {
 	header ?Strict-Transport-Security "max-age=63072000; includeSubDomains"
-	header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+	header ?Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'"
+	header -X-Powered-By
+	header -Server
 	header ?X-Content-Type-Options "nosniff"
 	header ?Referrer-Policy "strict-origin-when-cross-origin"
 	header ?Cross-Origin-Opener-Policy "same-origin"
