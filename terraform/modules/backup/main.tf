@@ -54,7 +54,7 @@ resource "aws_iam_role_policy_attachment" "dlm" {
 }
 
 resource "aws_dlm_lifecycle_policy" "daily" {
-  description        = "${var.project}-${var.environment} daily host-volume snapshots (crash-consistent; not the database backup)"
+  description        = "${var.project}-${var.environment} daily host-volume snapshots - crash-consistent - not the database backup"
   execution_role_arn = aws_iam_role.dlm.arn
   state              = "ENABLED"
   tags               = local.tags
