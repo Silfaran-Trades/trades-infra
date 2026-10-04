@@ -163,7 +163,8 @@ fallback — the first mitigation. When both fail: **wait out the window** (up t
 per-hostname limit), never loop restarts, never delete the `caddy-data` volume (it holds the
 issued certificates; re-issuance is what is rate-limited). The real domain at 10.9 removes the
 exposure. Check: `docker compose -f docker-compose.prod.yml logs caddy | grep -i acme`. The
-external pinger validates TLS (DE-006 Rung 0), so expiry warns before users see it.
+external pinger validates TLS (DE-006 Rung 0), so expiry warns before users see it — **deferred
+to 10.9** (spec AC-17): until then nothing outside the host watches certificate expiry.
 
 ## Triage a down / degraded service
 
@@ -299,8 +300,8 @@ CREATE, so every rotation ends with a `--force-recreate` of the readers:
 | Mercure keys | the `app` AND `mercure` parameters — same value in both | change both, recreate `app`, the workers and `mercure` together; a mismatch is silent |
 | Postgres password | the `postgres` parameter + `DATABASE_URL` in `app` and `media` | `ALTER USER` first, then the three parameters, then recreate |
 | MinIO root credentials | the `storage` parameter + `MEDIA_STORAGE_DSN` in `media` | rotate in MinIO, then the parameters, then recreate `media` |
-| the backup `age` key pair | recipient in `/srv/trades/secrets/backup-age.recipient`; the identity OFF-HOST in the developer's password manager | generate a new pair, update the recipient, keep the OLD identity until every dump encrypted with it has aged out (14 days) |
-| the basic-auth credential | `deploy/.env` on the host (hash) + the password manager | `caddy hash-password`, single-quote it, `up -d caddy` (above) |
+| the backup `age` key pair | recipient in `/srv/trades/secrets/backup-age.recipient`; the identity OFF-HOST in the SSM SecureString `/trades/production/operator/backup-age-key` | generate a new pair, update the recipient, keep the OLD identity until every dump encrypted with it has aged out (14 days) |
+| the basic-auth credential | `deploy/.env` on the host (hash) + `/trades/production/operator/web-login` | `caddy hash-password`, single-quote it, `up -d caddy` (above) |
 | `ai_readonly` (the agent role) | `/srv/trades/secrets/ai-readonly.env` + the `/trades/production/agent/database-url` parameter | re-run `agent-db/provision-agent-role.sh` with the new value, rewrite the parameter |
 | `SYNTHETIC_SEED_PASSWORD` | `/srv/trades/secrets/synthetic-seed.env`, ONE run | not rotated: deleted after the run; the seeded accounts keep it until the 10.9 wipe |
 
@@ -351,7 +352,11 @@ is the restore point:
 Recorded in `trades-docs/workspace.md` `environments.production.monitoring`: "Rung 2: external
 pinger + host alarms + host sentinel".
 
-- **Rung 0 — the external pinger** (HUMAN-registered, TLS-validating): polls
+- **Rung 0 — the external pinger — DEFERRED to 10.9** (the developer, 2026-10-03; spec AC-17):
+  stage 1 holds synthetic data for about a month, and Rungs 1–2 cover host death and unhealthy
+  containers. The gap is an outside-in failure (an expired certificate, the network) on a host
+  that otherwise looks healthy. Register it before the first real data. When registered
+  (HUMAN, TLS-validating), it polls
   `https://api.<base>/api/health` and `https://media.<base>/api/health` from outside — the host
   cannot report its own death.
 - **Rung 1 — the host alarms** (`terraform/modules/host-alarms`): `StatusCheckFailed` (two
@@ -366,14 +371,24 @@ Disk is the sentinel's alone (no CloudWatch agent is installed).
 
 ## Synthetic data — the stage-1 lane (BR-31, BR-31a)
 
-Production holds only the coherent demo dataset, loaded **once**, on the still-empty database,
-by the operator on the host:
+Production holds only the coherent demo dataset, loaded on the still-empty database by the
+operator. The passwords are kept as SecureStrings under `/trades/production/operator/`
+(`demo-users` — the synthetic accounts, `my-admin` — the owner's `platform_admin`; `make web-login`
+prints them) and reach the host for ONE run only: staged under `/trades/production/env/`,
+materialised by `fetch-secrets.sh` as mode-600 files, and deleted (files and staged parameters)
+after the run. Writes to the parameter store are the developer's acts.
 
 ```bash
-sudo -iu deploy
-umask 077 && printf 'SYNTHETIC_SEED_PASSWORD=%s\n' "$(openssl rand -base64 33 | tr -d '/+=' | cut -c1-24)" > /srv/trades/secrets/synthetic-seed.env   # note it in the password manager FIRST
+# Mac (operator profile): stage the run's passwords from their operator/ copies
+#   /trades/production/env/synthetic-seed  → SYNTHETIC_SEED_PASSWORD=…  (from operator/demo-users)
+#   /trades/production/env/owner-admin     → OWNER_ADMIN_PASSWORD=…     (from operator/my-admin)
+# host, as deploy:
+/srv/trades/fetch-secrets.sh
 /srv/trades/deploy/seed-synthetic.sh --confirm-production-stage-1
-rm -f /srv/trades/secrets/synthetic-seed.env
+# then the owner's platform_admin (BR-31a), password from owner-admin.env, never an argument
+# you type: app:create-user <owner e-mail> "$OWNER_ADMIN_PASSWORD" platform_admin in a one-off app container
+rm -f /srv/trades/secrets/synthetic-seed.env /srv/trades/secrets/owner-admin.env
+# Mac: aws ssm delete-parameter for env/synthetic-seed and env/owner-admin
 ```
 
 The lane refuses without the literal argument, refuses when `identity.users` is non-empty
@@ -387,17 +402,39 @@ step uploads its photos exactly as media-service presigns them — a `PUT` to
 intact; MinIO itself listens on plain 9000). The seeded
 accounts — the two synthetic `platform_admin` personas included — carry the per-run password,
 never the one published in `test-users.md` (AC-22); the password is handed to the partner out of
-band. **Then** the developer's own `platform_admin` is created with `app:create-user` (BR-31a).
+band. **Then** the developer's own `platform_admin` is created with `app:create-user` (BR-31a),
+and the agent-role lane below runs.
 
-A step that fails midway leaves a partial dataset, and the lane then refuses to re-run. Recovery
-in stage 1 (synthetic data only): stop the app and the workers, drop and recreate `trades_app`
-through the postgres container, re-promote `app` with the first-boot bypass, re-run the lane.
+The seed leaves known noise in the DLQ (push without a device token, notifications to the journey
+seed's fixed recipients — pending-items-log B-39). Diagnose with `messenger:failed:show` (§ DLQ)
+and drain it only once every message is one of those known classes; anything else is a bug.
+
+### Reload the dataset (stage 1 only — synthetic data)
+
+A partial load (a step failed midway, and the lane now refuses to re-run) and a deliberate
+replacement of the dataset take the same path. Used on 2026-10-04 to load the partner's taxonomy:
+
+1. Host: stop `app` and the three workers; drop and recreate `trades_app` through the `postgres`
+   container (pipe SQL over SSM base64-encoded — nested quotes break; and wrap any piped command in
+   `bash -c 'set -o pipefail; …'`, because `AWS-RunShellScript` runs `dash`).
+2. Mac: `make test-db-reset` in `trades-backend` FIRST (`promote.sh` runs `make quality` on the
+   existing test database, and a polluted one refuses the promotion), then
+   `scripts/promote.sh app <sha> --first-boot-skip-backup-gate` (accepted: the database is empty).
+3. Re-stage the EXISTING passwords (`operator/demo-users`, `operator/my-admin`, and the
+   `ai_readonly` password the agent DSN carries) into
+   `/trades/production/env/{synthetic-seed,owner-admin,ai-readonly}` — the same values, so the
+   partner's and the owner's logins and the agent DSN stay valid — and run `fetch-secrets.sh`.
+4. `seed-synthetic.sh`, then the owner's `platform_admin`, then
+   `agent-db/provision-agent-role.sh` (the masked views are rebuilt for the new database); then
+   delete the staged files and the three staged parameters.
+5. Drain the known DLQ noise (above) after checking every message's class.
 
 ### Synthetic-data record
 
 | Date (UTC) | Record line printed by `seed-synthetic.sh` |
 |---|---|
-| _(Phase 7 step 10)_ | |
+| 2026-10-03 | first load (Phase 7 step 10): 24 users, then the owner's `platform_admin`; a second run refused (`identity.users already holds 24 row(s)`) |
+| 2026-10-04 | reload with the partner's taxonomy (pending-items-log B-40): 24 users, 20 trades, 83 microskills, 11 demands; 76 mask views; 40 DLQ messages of the known classes drained |
 
 At 10.9 the synthetic data is wiped by a documented, evidenced step and this lane is deleted.
 
@@ -416,8 +453,11 @@ after every later migration or inventory change**:
 
 ```bash
 sudo -iu deploy
-umask 077 && printf 'AI_READONLY_PASSWORD=%s\n' "$(openssl rand -base64 33 | tr -d '/+=' | cut -c1-32)" > /srv/trades/secrets/ai-readonly.env   # password manager FIRST
+# Mac: stage AI_READONLY_PASSWORD=… as /trades/production/env/ai-readonly (a new value only on
+# the first run or a rotation; otherwise the value the DSN /trades/production/agent/database-url carries)
+/srv/trades/fetch-secrets.sh
 /srv/trades/deploy/agent-db/provision-agent-role.sh
+rm -f /srv/trades/secrets/ai-readonly.env   # then delete the staged env/ai-readonly parameter
 ```
 
 The script prints the HUMAN step that brokers the masked DSN under
@@ -439,8 +479,9 @@ a volume rebuild loses it; re-run the lane.
    by hand (registry, `bootstrap-pending` tags, base hostname, ACME e-mail, the basic-auth
    credential, the backups bucket) and verify it with `docker compose config`.
 3. `/srv/trades/fetch-secrets.sh` on the host; `/srv/trades/secrets/files/` (the JWT key pair,
-   the FCM file, the dummy password hash) and `backup-age.recipient` are restored from the
-   password manager.
+   the FCM file, the dummy password hash) and `backup-age.recipient` are restored from their
+   off-host copies. `files/` must be mode `755` so the containers' uid 33 can traverse it (set by
+   hand on the first host; not yet in the user-data).
 4. Re-promote every deployable at its current SHA with `scripts/promote.sh` (`app` first with
    `--first-boot-skip-backup-gate` only when the database is genuinely empty — a restored volume
    is not), then `media`, then `web`; confirm the whole runtime set is up.
@@ -551,6 +592,7 @@ each one.
 |---|---|
 | instance id, Elastic IP, base hostname, registry host, backups bucket, role ARNs, topic ARN | `terraform output` in `terraform/environments/production` (operator profile) and `trades-docs/workspace.md` `environments.production` |
 | the three profiles | `~/.aws/config` (above) |
-| the age private key, the basic-auth password, the synthetic-seed and `ai_readonly` passwords | the developer's password manager |
+| the age private key, the basic-auth login, the synthetic accounts' and the owner's passwords | SSM SecureStrings under `/trades/production/operator/` (operator only; host and agent denied) — `make web-login` prints the logins |
+| the `ai_readonly` password | the masked DSN `/trades/production/agent/database-url` carries it; staged under `env/ai-readonly` only for a run |
 | the external pinger | its dashboard, URL recorded in `workspace.md` |
 | what is live | the promotion records under `promotions/` in the backups bucket |
