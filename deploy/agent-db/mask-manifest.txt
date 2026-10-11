@@ -31,14 +31,14 @@ chat.crew_unlock_snapshot: user_a_id,user_b_id
 chat.message_antileak_review: llm_decision,regex_matches,reopened_by_user_id,reviewed_by_user_id,reviewer_notes
 chat.message_translations: translated_body
 chat.messages: antileak_matched_pattern,attachment_asset_id,attachment_filename,body_source
-chat.participant_snapshot: company_id,country_iso,display_name,locale,profile_photo_asset_id,role,verified_email,verified_phone
+chat.participant_snapshot: account_closed_at,company_id,country_iso,display_name,locale,profile_photo_asset_id,role,verified_email,verified_phone
 
 # --- comms ---
 comms.device_tokens: token,user_id
 comms.notification_frequency_log: user_id
 comms.notification_preferences: quiet_hours_tz,user_id
 comms.notifications: provider_message_id,recipient_id,sms_to_phone_e164,variables,whatsapp_template_name
-comms.recipients: email_address,first_name,locale_synced_at,phone_e164,phone_verified_at
+comms.recipients: closed_at,email_address,first_name,locale_synced_at,phone_e164,phone_verified_at
 
 # --- company ---
 company.companies: company_type,contact_person,created_at,id,name,sector,size,vat_id,verification_decided_by_user_id,verification_evidence_basis,verification_reason,verified_at,web
@@ -60,10 +60,11 @@ demand.profile_snapshot_for_matching: availability,certifications,civil_liabilit
 
 # --- identity ---
 identity.email_verifications: email
+identity.legal_acceptances: accepted_at,channel,document_type,document_version,user_id
 identity.oauth_identities: email,provider,provider_user_id
 identity.phone_verifications: phone_e164
-identity.refresh_tokens: ip_address,user_agent
-identity.users: email,first_name,last_name,phone_e164
+identity.refresh_tokens: authenticated_at,ip_address,user_agent
+identity.users: closed_at,email,first_name,last_name,phone_e164
 
 # --- incidents ---
 incidents.incident_evidence: asset_id,caption,filename
