@@ -480,7 +480,9 @@ volume; full suites green). Production, in order — each step is the operator's
    (pristine `git archive`, linux/arm64, Trivy gate, push, prints the digest ECR reports).
 3. **Pin** — one PR: `deploy/docker-compose.prod.yml` `postgres.image:
    ${REGISTRY:?set REGISTRY in deploy/.env}/trades/postgres@sha256:<that digest>` and the same
-   reference as `deploy/restore-drill.sh`'s `PG_IMAGE` default; `make quality`; merge.
+   `deploy/restore-drill.sh`'s `PG_IMAGE` default → `trades/postgres:<tag>` (the drill runs on the
+   Mac without an ECR login: build that tag there with `docker build -t trades/postgres:<tag>
+   images/postgis` from the same commit); `make quality`; merge.
 4. **Backup gate** — on the host: `/srv/trades/deploy/backup-postgres.sh` (a fresh dump of
    `trades_app` + `media`, off-host copy confirmed in its output). Note the two file names.
 5. **Sync** — `scripts/sync-host-deploy.sh` (§ "Host sync"). From here the compose names the new
@@ -498,7 +500,16 @@ volume; full suites green). Production, in order — each step is the operator's
    $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "SELECT version()"'                       # 18.6
    # collation check — EXPECT no rows (same glibc 2.41); a row means REINDEX that database first
    $P 'psql -U "$POSTGRES_USER" -d postgres -Atc "SELECT datname FROM pg_database WHERE datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid) AND datname <> '"'"'template0'"'"'"'
-   $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "ALTER EXTENSION postgis UPDATE; SELECT postgis_full_version()"'   # POSTGIS="3.6.4 …"
+   # production was initialised on imresamu, whose init script ALSO created `template_postgis` and
+   # installed postgis_topology / fuzzystrmatch / postgis_tiger_geocoder in it and in trades_app —
+   # dev never had them. Upgrade EVERY PostGIS extension, in both databases, with PostGIS's own
+   # function (run it again if its output says so), then read the versions back: all 3.6.4.
+   for db in trades_app template_postgis; do
+     $P "psql -U \"\$POSTGRES_USER\" -d $db -Atc \"SELECT extname, extversion FROM pg_extension ORDER BY 1\""
+     $P "psql -U \"\$POSTGRES_USER\" -d $db -Atc \"SELECT postgis_extensions_upgrade()\""
+     $P "psql -U \"\$POSTGRES_USER\" -d $db -Atc \"SELECT extname, extversion FROM pg_extension ORDER BY 1\""
+   done
+   $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "SELECT postgis_full_version()"'   # POSTGIS="3.6.4 …", no "need upgrade"
    $P 'psql -U "$POSTGRES_USER" -d trades_app -c ANALYZE'
    $P 'psql -U "$POSTGRES_USER" -d media -c ANALYZE'
    ```
@@ -510,11 +521,13 @@ volume; full suites green). Production, in order — each step is the operator's
    workers `RUNNING`, a logged-in search on the public directory returns results (the FTS / geo
    path). Then a restore drill from the Mac against the step-4 dumps (`restore-drill.sh`, new
    image) and record it under "Restore drill evidence".
-9. **Rollback** — the old image reads the same data directory (18.6 → 18.1 is a minor downgrade
+9. **Rollback** — FIRST a fresh `backup-postgres.sh` (whatever was written on 18.6). The old
+   image reads the same data directory (18.6 → 18.1 is a minor downgrade
    on the same major and the same glibc): repin `imresamu/postgis:18-3.6@sha256:b5766ee7…` (git
    revert of step 3, sync), then step 6. The extension stays at 3.6.4 in the catalog while
-   the 3.6.1 library is loaded — if PostGIS errors, restore the step-4 dumps (§ "Restore the
-   database") instead of downgrading the extension.
+   the 3.6.1 library is loaded — if PostGIS errors, restore the rollback's own fresh dump
+   (§ "Restore the database"; the step-4 dumps lose everything written since step 6) instead of
+   downgrading the extension.
 
 ## Pinned third-party image bump (mercure, mailpit, clamav)
 
@@ -525,6 +538,13 @@ then its healthcheck (`ps <service>` healthy). Mercure specifically: `wget -qO- 
 inside the container answers, the app's `/api/realtime/token` still mints, and a chat message
 sent in one browser appears live in the other. Rollback: revert the pin, sync, the same two
 commands.
+
+Mercure v0.16 → v0.24.2 also changed the hub's DEFAULT transport: v0.16's Caddyfile set
+`transport_url bolt:///data/mercure.db`; v0.24.2's sets none, so history is in-process memory.
+`Last-Event-ID` replay on reconnect still works (verified), and production's `/data` was a tmpfs
+anyway (history already died with every recreate) — `/data` now holds only Caddy's storage. A
+bounded or persistent history would be an explicit `transport` directive. `/healthz` is marked
+deprecated in the v0.24 image (Mercure 1.x removes it; the 1.x spec moves the healthcheck).
 
 ## Restore the database
 

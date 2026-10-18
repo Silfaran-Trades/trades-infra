@@ -21,7 +21,10 @@
 # Bumping: re-resolve the base digest with `docker buildx imagetools inspect postgres:<x.y>-trixie`
 # and list the PostGIS builds PGDG offers with
 #   docker run --rm postgres:<x.y>-trixie sh -c 'apt-get update -qq && apt-cache madison postgresql-18-postgis-3'
-# then update POSTGIS_DEB below. After a PostGIS bump an EXISTING database still carries the old
+# then update POSTGIS_DEB below AND keep three strings equal: the LABEL version at the bottom,
+# the dev compose tag (docker-compose.yml) — `make postgres-image-tag` checks both. PGDG rotates
+# old builds out of trixie-pgdg (3.6.1 is already gone): a build failing with "Version … was not
+# found" means this pin aged out — bump it, never loosen it. After a PostGIS bump an EXISTING database still carries the old
 # extension version until `ALTER EXTENSION postgis UPDATE;` runs in it (deploy/RUNBOOK.md).
 
 # PostgreSQL 18.6 on Debian trixie — the multi-arch index digest (BR-2: a tag is not a pin).

@@ -24,7 +24,7 @@
 #                           images/postgis): HIGH / CRITICAL with a fix available → exit 1 (AS-018)
 #   make infra-up / infra-down — the shared DEV stack (normally driven from ai-standards)
 
-.PHONY: container-scan quality shellcheck compose-config caddy-adapt actionlint image-pins gitleaks dast-baseline dast-high-check dast-high-selftest terraform-fmt terraform-validate tf-plan-check tf-plan-check-selftest mask-manifest mask-manifest-check rehearse rehearse-down infra-up infra-down web-login _require-docker _security-reports-dir
+.PHONY: container-scan postgres-image-tag quality shellcheck compose-config caddy-adapt actionlint image-pins gitleaks dast-baseline dast-high-check dast-high-selftest terraform-fmt terraform-validate tf-plan-check tf-plan-check-selftest mask-manifest mask-manifest-check rehearse rehearse-down infra-up infra-down web-login _require-docker _security-reports-dir
 
 SHELLCHECK_IMAGE ?= koalaman/shellcheck-alpine:v0.11.0@sha256:9955be09ea7f0dbf7ae942ac1f2094355bb30d96fffba0ec09f5432207544002
 ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
@@ -95,6 +95,15 @@ gitleaks: _require-docker
 	docker run --rm -v "$(CURDIR):/repo:ro" $(GITLEAKS_IMAGE) dir /repo --config /repo/.gitleaks.toml --redact --no-banner --exit-code 1
 	@echo "→ gitleaks: OK"
 
+# The own postgres image's version lives in two places — the Dockerfile LABEL (the ECR tag
+# scripts/publish-postgres-image.sh pushes) and the dev compose tag (compose only rebuilds a tag
+# it does not have). A bump that moves one and not the other ships a stale image silently.
+postgres-image-tag:
+	@label="$$(sed -n 's/.*org\.opencontainers\.image\.version="\([^"]*\)".*/\1/p' images/postgis/Dockerfile | head -1)"; \
+	  tag="$$(sed -n 's#^ *image: trades/postgres:\([^ ]*\).*#\1#p' docker-compose.yml | head -1)"; \
+	  [ -n "$$label" ] && [ "$$label" = "$$tag" ] || { echo "✗ postgres image: Dockerfile label '$$label' != docker-compose.yml tag '$$tag'"; exit 1; }; \
+	  echo "→ postgres image tag: OK ($$label)"
+
 # The image this repository BUILDS (images/postgis — the own PostgreSQL + PostGIS image) is
 # scanned like every deployable (AS-018): read from the local daemon through the socket, the DB
 # cached in the shared `trivy-cache` volume. scripts/publish-postgres-image.sh runs it before
@@ -115,7 +124,7 @@ container-scan: _require-docker
 		"$(IMAGE)"
 	@echo "→ container scan: OK ($(IMAGE))"
 
-quality: shellcheck compose-config caddy-adapt actionlint image-pins gitleaks dast-high-selftest terraform-fmt terraform-validate tf-plan-check-selftest
+quality: postgres-image-tag shellcheck compose-config caddy-adapt actionlint image-pins gitleaks dast-high-selftest terraform-fmt terraform-validate tf-plan-check-selftest
 	@echo "→ infra quality: PASS"
 
 # --- Terraform: the IaC gates (production-infrastructure-first-deploy BR-36; infrastructure.md

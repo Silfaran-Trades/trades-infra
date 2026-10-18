@@ -77,9 +77,17 @@ REGISTRY="${REGISTRY:-${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com}"
 REPO="${PROJECT}/${REPO_NAME}"
 DST="${REGISTRY}/${REPO}:${TAG}"
 
-ecr_digest_for_tag() {   # → the digest or empty
-  aws ecr describe-images --repository-name "$REPO" --image-ids "imageTag=$1" \
-    --query 'imageDetails[0].imageDigest' --output text 2>/dev/null | grep -v '^None$' || true
+ecr_digest_for_tag() {   # → the digest, empty when the TAG is absent; dies on any other AWS error
+  local out
+  if out="$(aws ecr describe-images --repository-name "$REPO" --image-ids "imageTag=$1" \
+      --query 'imageDetails[0].imageDigest' --output text 2>&1)"; then
+    [ "$out" = "None" ] || printf '%s' "$out"
+    return 0
+  fi
+  case "$out" in
+    *ImageNotFoundException*) return 0 ;;
+    *) die "aws ecr describe-images failed (not a missing tag — is the repository applied, RUNBOOK step 1?): $out" ;;
+  esac
 }
 existing="$(ecr_digest_for_tag "$TAG")"
 if [ -n "$existing" ]; then
