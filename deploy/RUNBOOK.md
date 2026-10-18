@@ -67,12 +67,12 @@ region         = eu-south-2
 | `worker-default` | same image, same tag | `messenger:consume async_default` | `php` is PID 1 |
 | `worker-heavy` | same image, same tag | `messenger:consume async_heavy` | `php` is PID 1 |
 | `worker-scheduler` | same image, same tag | the nine `schedule://` transports carrying the registered jobs of `trades-docs/scheduled-jobs.md` | `php` is PID 1 |
-| `mercure` | `dunglas/mercure:v0.16` | Chat's SSE hub, served at `api.{domain}/.well-known/mercure` | `/healthz` |
+| `mercure` | `dunglas/mercure:v0.24.2` (multi-arch digest) | Chat's SSE hub, served at `api.{domain}/.well-known/mercure` | `/healthz` |
 | `media` | `${REGISTRY}/trades/media-service:{MEDIA_TAG}` | media-service HTTP + its `scan-worker` and `process-worker` under supervisord | `GET /api/health` (bucket probe) **and** both workers `RUNNING` |
 | `clamav` | `clamav/clamav:1.5.4-debian13-slim` (multi-arch digest; the bare `1.5.4` tag is amd64-only) | the antivirus daemon | `clamdscan --ping` |
 | `storage` (+ `storage-init`) | `${REGISTRY}/trades/minio@sha256:…` / `…/mc@sha256:…` (ADR-126) | the object store (synthetic media only in stage 1); public endpoint `storage.{domain}` behind the perimeter's storage filter (ADR-135); `storage-init` converges the two buckets AND the two least-privilege users `media-presign` / `media-service` media-service runs as — root stays in `storage.env` only (§ "Object storage identities and the root rotation") | `/minio/health/live`; `storage-init` exited 0 |
 | `mailpit` | `axllent/mailpit:v1.31.6` | stage-1 mail capture: every message the platform sends, nothing leaves the host; viewer at `mail.{domain}` behind basic auth; bounded 500 messages / 14 days | `mailpit readyz` |
-| `postgres` | `imresamu/postgis:18-3.6` | one instance: `trades_app` (one schema per bundle) + `media` | `pg_isready` |
+| `postgres` | `imresamu/postgis:18-3.6` → the own `${REGISTRY}/trades/postgres@sha256:…` (PostgreSQL 18.6 + PostGIS 3.6.4, § "PostgreSQL image upgrade") | one instance: `trades_app` (one schema per bundle) + `media` | `pg_isready` |
 | `web` | `${REGISTRY}/trades/trades-front:{WEB_TAG}` | the SPA (static, unprivileged nginx) | `GET /` |
 
 Three tags, not four: the workers **ride `APP_TAG`** and never carry their own — `deploy.sh app`
@@ -464,6 +464,87 @@ pilot, then quarterly. Record each drill's output line here:
 | Date | Dump restored | Result |
 |---|---|---|
 | 2026-10-03 | `trades_app-20261003-070229` + `media-20261003-070229`, fetched from the off-host copy on the Mac (operator profile) | OK — every schema read (e.g. `audit.audit_log`=163, `company.companies`=4, `demand.candidacies`=16); first run failed on the `ai_readonly` GRANTs until `--no-privileges` |
+
+## PostgreSQL image upgrade — the own image (PostgreSQL 18.6 + PostGIS 3.6.4)
+
+`images/postgis/Dockerfile` is the official `postgres:18.6-trixie` image (digest-pinned) plus the
+PGDG `postgresql-18-postgis-3` packages at an exact version — the same recipe as the imresamu
+image it replaces, on the same Debian trixie with the same **glibc 2.41**, so the existing data
+volume starts as-is: same major (18), same data layout, same libc collation version → **no
+re-init, no dump/restore, no REINDEX**. Development runs it since 2026-10-18 (in place on the dev
+volume; full suites green). Production, in order — each step is the operator's act (IA-004):
+
+1. **Repository** — `terraform plan` shows exactly one new `aws_ecr_repository` (`trades/postgres`)
+   and the host's ECR read policy gaining its ARN; nothing else. Apply.
+2. **Image** — on the Mac, master synced: `AWS_PROFILE=trades-prod scripts/publish-postgres-image.sh`
+   (pristine `git archive`, linux/arm64, Trivy gate, push, prints the digest ECR reports).
+3. **Pin** — one PR: `deploy/docker-compose.prod.yml` `postgres.image:
+   ${REGISTRY:?set REGISTRY in deploy/.env}/trades/postgres@sha256:<that digest>` and the same
+   `deploy/restore-drill.sh`'s `PG_IMAGE` default → `trades/postgres:<tag>` (the drill runs on the
+   Mac without an ECR login: build that tag there with `docker build -t trades/postgres:<tag>
+   images/postgis` from the same commit); `make quality`; merge.
+4. **Backup gate** — on the host: `/srv/trades/deploy/backup-postgres.sh` (a fresh dump of
+   `trades_app` + `media`, off-host copy confirmed in its output). Note the two file names.
+5. **Sync** — `scripts/sync-host-deploy.sh` (§ "Host sync"). From here the compose names the new
+   image: do NOT run `deploy.sh` for anything until step 7 is done (an `up -d app` would recreate
+   its `postgres` dependency implicitly, outside this procedure).
+6. **Recreate** — on the host, as `deploy`, in `/srv/trades/deploy`:
+   ```bash
+   docker compose -f docker-compose.prod.yml pull postgres
+   docker compose -f docker-compose.prod.yml stop worker-default worker-heavy worker-scheduler media app
+   docker compose -f docker-compose.prod.yml up -d --no-deps postgres
+   docker compose -f docker-compose.prod.yml ps postgres          # healthy
+   ```
+7. **Extension + statistics** — in the same shell (`P='docker compose -f docker-compose.prod.yml exec -T postgres sh -c'`):
+   ```bash
+   $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "SELECT version()"'                       # 18.6
+   # collation check — EXPECT no rows (same glibc 2.41); a row means REINDEX that database first
+   $P 'psql -U "$POSTGRES_USER" -d postgres -Atc "SELECT datname FROM pg_database WHERE datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid) AND datname <> '"'"'template0'"'"'"'
+   # production was initialised on imresamu, whose init script ALSO created `template_postgis` and
+   # installed postgis_topology / fuzzystrmatch / postgis_tiger_geocoder in it and in trades_app —
+   # dev never had them. Upgrade EVERY PostGIS extension, in both databases, with PostGIS's own
+   # function (run it again if its output says so), then read the versions back: all 3.6.4.
+   for db in trades_app template_postgis; do
+     $P "psql -U \"\$POSTGRES_USER\" -d $db -Atc \"SELECT extname, extversion FROM pg_extension ORDER BY 1\""
+     $P "psql -U \"\$POSTGRES_USER\" -d $db -Atc \"SELECT postgis_extensions_upgrade()\""
+     $P "psql -U \"\$POSTGRES_USER\" -d $db -Atc \"SELECT extname, extversion FROM pg_extension ORDER BY 1\""
+   done
+   $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "SELECT postgis_full_version()"'   # POSTGIS="3.6.4 …", no "need upgrade"
+   $P 'psql -U "$POSTGRES_USER" -d trades_app -c ANALYZE'
+   $P 'psql -U "$POSTGRES_USER" -d media -c ANALYZE'
+   ```
+   `ANALYZE` refreshes the planner statistics of every table — the GIN indexes
+   (`profile.profiles` FTS + trigram, `demand.demands` operating contexts,
+   `demand.profile_snapshot_for_matching` microskills) and the GiST geography indexes included.
+8. **Start + verify** — `docker compose -f docker-compose.prod.yml up -d --no-deps app media worker-default worker-heavy worker-scheduler`;
+   `GET https://api.{domain}/api/health` 200 (database probe), media health 200, both media
+   workers `RUNNING`, a logged-in search on the public directory returns results (the FTS / geo
+   path). Then a restore drill from the Mac against the step-4 dumps (`restore-drill.sh`, new
+   image) and record it under "Restore drill evidence".
+9. **Rollback** — FIRST a fresh `backup-postgres.sh` (whatever was written on 18.6). The old
+   image reads the same data directory (18.6 → 18.1 is a minor downgrade
+   on the same major and the same glibc): repin `imresamu/postgis:18-3.6@sha256:b5766ee7…` (git
+   revert of step 3, sync), then step 6. The extension stays at 3.6.4 in the catalog while
+   the 3.6.1 library is loaded — if PostGIS errors, restore the rollback's own fresh dump
+   (§ "Restore the database"; the step-4 dumps lose everything written since step 6) instead of
+   downgrading the extension.
+
+## Pinned third-party image bump (mercure, mailpit, clamav)
+
+`deploy.sh` starts `caddy mercure mailpit` with `--no-recreate`, so a merged digest bump of one of
+them reaches the host only through this lane: `scripts/sync-host-deploy.sh`, then on the host
+`docker compose -f docker-compose.prod.yml pull <service> && docker compose -f docker-compose.prod.yml up -d --no-deps <service>`,
+then its healthcheck (`ps <service>` healthy). Mercure specifically: `wget -qO- http://127.0.0.1:80/healthz`
+inside the container answers, the app's `/api/realtime/token` still mints, and a chat message
+sent in one browser appears live in the other. Rollback: revert the pin, sync, the same two
+commands.
+
+Mercure v0.16 → v0.24.2 also changed the hub's DEFAULT transport: v0.16's Caddyfile set
+`transport_url bolt:///data/mercure.db`; v0.24.2's sets none, so history is in-process memory.
+`Last-Event-ID` replay on reconnect still works (verified), and production's `/data` was a tmpfs
+anyway (history already died with every recreate) — `/data` now holds only Caddy's storage. A
+bounded or persistent history would be an explicit `transport` directive. `/healthz` is marked
+deprecated in the v0.24 image (Mercure 1.x removes it; the 1.x spec moves the healthcheck).
 
 ## Restore the database
 

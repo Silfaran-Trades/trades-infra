@@ -18,15 +18,21 @@ name: workspacetrades
 
 services:
   postgres:
-    # imresamu/postgis is the multi-arch (amd64 + arm64) build of the SAME
-    # upstream PostGIS Dockerfiles, maintained by a PostGIS contributor. The
-    # official postgis/postgis:18-* is amd64-only, which forced Rosetta/QEMU
-    # emulation on Apple Silicon (slow). This variant runs natively on both
-    # arches, so no platform pin is needed. Same PG 18 + PostGIS 3.6 → the
-    # existing postgres_data volume is compatible (no re-init).
-    # Digest-pinned (BR-2, `make image-pins` — a tag is not a pin). Re-resolve after a bump
-    # with `docker buildx imagetools inspect imresamu/postgis:<tag>`.
-    image: imresamu/postgis:18-3.6@sha256:b5766ee720aca09c61b9a868abefbf273348a4b90ad4cf146b4f8c9ac85d48e4
+    # The project's OWN PostgreSQL 18.6 + PostGIS 3.6.4 image, built from
+    # images/postgis/Dockerfile (the official `postgres:18.6-trixie` image, digest-pinned, plus
+    # the PGDG PostGIS packages at an exact version) — the same file production's image is
+    # built from (deploy/RUNBOOK.md). It replaced `imresamu/postgis:18-3.6`, whose tags froze on
+    # PostgreSQL 18.1; the official postgis/postgis:18-* is amd64-only. Same Debian trixie and
+    # glibc 2.41 as before → the existing postgres_data volume starts as-is (no re-init, no
+    # REINDEX); after the first start on a new PostGIS run `ALTER EXTENSION postgis UPDATE;`
+    # in every database that has it. Native on Apple Silicon and on amd64.
+    # `make infra-up` builds it when the tag is missing locally (the tag names both versions,
+    # so a bump in the Dockerfile + this tag rebuilds); the pins live in the Dockerfile (base
+    # digest + package version) and the local tag below is never pulled from a registry.
+    build:
+      context: ./images/postgis
+    # as018-ok: built locally from images/postgis/Dockerfile (digest-pinned base, exact apt version) — never pulled
+    image: trades/postgres:18.6-postgis-3.6.4
     container_name: trades-postgres
     # Every service in the workspace depends on this container AND uses it as the
     # `doctrine://` Messenger transport, so it must come back with the Docker daemon
