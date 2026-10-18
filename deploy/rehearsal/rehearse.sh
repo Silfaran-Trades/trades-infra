@@ -96,8 +96,11 @@ gen_hex() { head -c "${1:-32}" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 # --- env-file rendering -----------------------------------------------------------------
 # render_env <.env.example> <overrides> <out>: every key of the example, in its order; an
 # override wins; CHANGE_ME (or `@generate…`) is generated; override keys absent from the
-# example are appended. Tokens @DOMAIN@ @SUBNET@ @POSTGRES_PASSWORD@ @MINIO_ROOT_USER@
-# @MINIO_ROOT_PASSWORD@ are substituted last.
+# example are appended. Tokens @DOMAIN@ @SUBNET@ @POSTGRES_PASSWORD@
+# @MEDIA_STORAGE_PRESIGN_SECRET_KEY@ @MEDIA_STORAGE_SERVICE_SECRET_KEY@ are substituted last.
+# There is NO @MINIO_ROOT_*@ token any more (ADR-135): no application env file may carry the
+# store's root credentials, so a template that still asks for them lands its placeholder
+# literally and fails loudly in the stack rather than quietly handing root to a service.
 override_value() {   # override_value <overrides> <key>  → prints the value, rc 1 if absent
   grep -E "^${2}=" "$1" 2>/dev/null | head -1 | cut -d= -f2- || return 1
   grep -qE "^${2}=" "$1" 2>/dev/null
@@ -133,8 +136,8 @@ render_env() {
   sed -e "s|@DOMAIN@|${DOMAIN}${PORT_SUFFIX}|g" \
       -e "s|@SUBNET@|${TRADES_PROD_SUBNET}|g" \
       -e "s|@POSTGRES_PASSWORD@|${POSTGRES_PASSWORD}|g" \
-      -e "s|@MINIO_ROOT_USER@|${MINIO_ROOT_USER}|g" \
-      -e "s|@MINIO_ROOT_PASSWORD@|${MINIO_ROOT_PASSWORD}|g" \
+      -e "s|@MEDIA_STORAGE_PRESIGN_SECRET_KEY@|${MEDIA_STORAGE_PRESIGN_SECRET_KEY}|g" \
+      -e "s|@MEDIA_STORAGE_SERVICE_SECRET_KEY@|${MEDIA_STORAGE_SERVICE_SECRET_KEY}|g" \
       "$out" > "$out.tmp" && mv "$out.tmp" "$out"
   chmod 600 "$out"
 }
@@ -211,10 +214,17 @@ generate_secrets() {
   mkdir -p "$SECRETS/files" "$SCRATCH/backups" "$SCRATCH/log-archive" "$SCRATCH/ca"
   chmod 700 "$SECRETS"
 
-  # infrastructure credentials (postgres.env / storage.env; mercure.env after app.env)
+  # infrastructure credentials (postgres.env / storage.env; mercure.env after app.env).
+  # storage.env carries the root pair (read by `storage` and the `storage-init` bootstrap ONLY)
+  # and the two identity secrets the bootstrap provisions `media-presign` / `media-service`
+  # with (ADR-135); media.env below gets the SAME two identity values through the render
+  # tokens and never the root pair — exactly the stage-1 split between the `storage` and
+  # `media` parameters (RUNBOOK.md § "Rotate a secret").
   POSTGRES_PASSWORD="$(gen_hex 32)"; MINIO_ROOT_USER="trades-storage"; MINIO_ROOT_PASSWORD="$(gen_hex 32)"
+  MEDIA_STORAGE_PRESIGN_SECRET_KEY="$(gen_hex 32)"; MEDIA_STORAGE_SERVICE_SECRET_KEY="$(gen_hex 32)"
   printf 'POSTGRES_USER=trades\nPOSTGRES_PASSWORD=%s\nPOSTGRES_DB=trades_app\n' "$POSTGRES_PASSWORD" > "$SECRETS/postgres.env"
-  printf 'MINIO_ROOT_USER=%s\nMINIO_ROOT_PASSWORD=%s\n' "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" > "$SECRETS/storage.env"
+  printf 'MINIO_ROOT_USER=%s\nMINIO_ROOT_PASSWORD=%s\nMEDIA_STORAGE_PRESIGN_SECRET_KEY=%s\nMEDIA_STORAGE_SERVICE_SECRET_KEY=%s\n' \
+    "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" "$MEDIA_STORAGE_PRESIGN_SECRET_KEY" "$MEDIA_STORAGE_SERVICE_SECRET_KEY" > "$SECRETS/storage.env"
   chmod 600 "$SECRETS/postgres.env" "$SECRETS/storage.env"
 
   # the two application env files — every key of each .env.example (AC-13 parity)
@@ -463,6 +473,9 @@ print_evidence_hints() {
     (seed lane, AC-18/AC-22 — on the EMPTY database, once; uploads go through caddy, whose local root the app containers trust here via $APP_CA_BUNDLE)
     umask 077 && printf 'SYNTHETIC_SEED_PASSWORD=%s\n' "\$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" > $SECRETS/synthetic-seed.env
     COMPOSE_DIR=$DEPLOY SEED_PASSWORD_FILE=$SECRETS/synthetic-seed.env $DEPLOY/seed-synthetic.sh --confirm-production-stage-1
+    (object storage, ADR-135 — the perimeter filter and the two identities; the scratch storage.env holds root + both identity secrets)
+    docker compose --project-directory $DEPLOY -f $DEPLOY/docker-compose.prod.yml run --rm --entrypoint sh storage-init -c 'mc alias set local http://storage:9000 "\$MINIO_ROOT_USER" "\$MINIO_ROOT_PASSWORD" >/dev/null && mc admin user ls local && mc admin user svcacct ls local media-presign && mc admin user svcacct ls local media-service'
+    curl -sS -o /dev/null -w '%{http_code}\n' \$R -X PUT -H 'X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER' https://storage.${DOMAIN}${PORT_SUFFIX}/media-private/private/11111111-1111-4111-8111-111111111111/22222222-2222-4222-8222-222222222222/x.pdf   # 403 (the full set: scripts/tests/storage-perimeter.test.sh)
     (agent-role lane, AC-14/TM-3 — after the migrations; re-run after any inventory change)
     umask 077 && printf 'AI_READONLY_PASSWORD=%s\n' "\$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" > $SECRETS/ai-readonly.env
     COMPOSE_DIR=$DEPLOY AI_READONLY_ENV_FILE=$SECRETS/ai-readonly.env $DEPLOY/agent-db/provision-agent-role.sh

@@ -13,7 +13,8 @@
 #   media               media-service (php-fpm + nginx + its two workers under supervisord)
 #   clamav              the antivirus daemon the media scan worker calls
 #   storage / storage-init   MinIO (ADR-126: the last community images, mirrored into this
-#                       project's ECR) + the one-shot bucket bootstrap
+#                       project's ECR) + the one-shot bucket AND identity bootstrap (ADR-135:
+#                       the two least-privilege users media-service runs as; root stays here)
 #   mailpit             stage-1 mail capture (BR-25): every message the platform sends lands
 #                       here and nothing leaves the host; viewer at mail.{DOMAIN} behind basic auth
 #   postgres            PostgreSQL 18 + PostGIS — one instance, `trades_app` + `media`
@@ -309,13 +310,40 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-shot bucket bootstrap (idempotent). `media` waits for it to complete successfully.
+  # One-shot bucket + identity bootstrap (idempotent — every run converges, never duplicates,
+  # never fails on "already exists"). `media` waits for it to complete successfully.
+  #
+  # ROOT IS FOR THIS ONE-SHOT ONLY (ADR-135, minio-storage-perimeter-hardening BR-10..BR-14):
+  # media-service never holds MINIO_ROOT_*. This bootstrap creates the two least-privilege
+  # PLAIN users (never service accounts or STS — CVE-2025-62506 bypasses a session-policy
+  # restriction) with a NAMED policy each:
+  #   media-presign   signs presigned URLs: PutObject + GetObject under media-public/public/*
+  #                   and media-private/private/*. S3 has no separate copy permission (a
+  #                   server-side CopyObject is Get on the source + Put on the destination, which
+  #                   these two grants cover — measured), so the policy adds an explicit Deny of
+  #                   PutObject when `x-amz-copy-source` is present (the `Null` condition;
+  #                   measured on the pinned release: a presigned PUT + GET still succeed, a
+  #                   presigned PUT carrying X-Amz-Copy-Source is AccessDenied). Its access key is
+  #                   in every presigned URL by the design of SigV4 presigning; the boundary is
+  #                   that the SECRET never leaves media-service and that the perimeter refuses
+  #                   and strips X-Amz-Copy-Source (deploy/Caddyfile, the storage route)
+  #   media-service   media-service's own server-side work: ListBucket (the health probe's
+  #                   headBucket) on the two buckets, Get/Put/DeleteObject on their objects
+  #                   (head-object and copy ride Get/Put)
+  # Both carry an explicit `Deny admin:*` — WITHOUT it a plain user with no admin grant can still
+  # mint a service account for itself on this release (measured at refinement, evidence § 3).
+  # The two secrets come from storage.env beside the root pair (the SAME values media.env
+  # carries — RUNBOOK.md § "Rotate a secret"); the bootstrap refuses to complete on an empty
+  # one, or while either user owns a service account (one created by root by hand survives a
+  # root rotation — remove it, then re-run). The policy documents below are byte-identical to
+  # media-service/docker-compose.yml's `media-minio-init` (the development bootstrap); the
+  # build compares them. Every `$` is `$$` — compose interpolation must not touch the script.
   storage-init:
     image: ${REGISTRY:?set REGISTRY in deploy/.env}/trades/mc@sha256:37d109dddbbb2c95873f5fc81ac93f37023264770fc580a7564148892087b1b7
     networks: [prod-network]
     restart: "no"
     env_file:
-      - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/storage.env
+      - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/storage.env   # MINIO_ROOT_* + MEDIA_STORAGE_{PRESIGN,SERVICE}_SECRET_KEY
     read_only: true
     tmpfs:
       - /tmp:size=16m
@@ -326,6 +354,9 @@ services:
     command:
       - |
         set -e
+        [ -n "$$MINIO_ROOT_USER" ] && [ -n "$$MINIO_ROOT_PASSWORD" ] || { echo 'bootstrap: MINIO_ROOT_USER / MINIO_ROOT_PASSWORD is empty — refusing to run' >&2; exit 1; }
+        [ -n "$$MEDIA_STORAGE_PRESIGN_SECRET_KEY" ] || { echo 'bootstrap: MEDIA_STORAGE_PRESIGN_SECRET_KEY is empty — refusing to provision the media-presign identity (ADR-135)' >&2; exit 1; }
+        [ -n "$$MEDIA_STORAGE_SERVICE_SECRET_KEY" ] || { echo 'bootstrap: MEDIA_STORAGE_SERVICE_SECRET_KEY is empty — refusing to provision the media-service identity (ADR-135)' >&2; exit 1; }
         until mc alias set local http://storage:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
           echo 'waiting for storage...'; sleep 1
         done
@@ -334,7 +365,62 @@ services:
         mc anonymous set download local/media-public
         : > /tmp/.bootstrap-probe
         mc cp /tmp/.bootstrap-probe local/media-public/.bootstrap-probe
-        echo 'media-public (anonymous download) + media-private buckets ready'
+        cat > /tmp/media-presign.json <<'POLICY'
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:PutObject", "s3:GetObject"],
+              "Resource": ["arn:aws:s3:::media-public/public/*", "arn:aws:s3:::media-private/private/*"]
+            },
+            {
+              "Effect": "Deny",
+              "Action": ["s3:PutObject"],
+              "Resource": ["arn:aws:s3:::media-public/public/*", "arn:aws:s3:::media-private/private/*"],
+              "Condition": { "Null": { "s3:x-amz-copy-source": "false" } }
+            },
+            {
+              "Effect": "Deny",
+              "Action": ["admin:*"]
+            }
+          ]
+        }
+        POLICY
+        cat > /tmp/media-service.json <<'POLICY'
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:ListBucket"],
+              "Resource": ["arn:aws:s3:::media-public", "arn:aws:s3:::media-private"]
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+              "Resource": ["arn:aws:s3:::media-public/*", "arn:aws:s3:::media-private/*"]
+            },
+            {
+              "Effect": "Deny",
+              "Action": ["admin:*"]
+            }
+          ]
+        }
+        POLICY
+        mc admin policy create local media-presign /tmp/media-presign.json
+        mc admin policy create local media-service /tmp/media-service.json
+        mc admin user add local media-presign "$$MEDIA_STORAGE_PRESIGN_SECRET_KEY"
+        mc admin user add local media-service "$$MEDIA_STORAGE_SERVICE_SECRET_KEY"
+        for u in media-presign media-service; do
+          out="$$(mc admin policy attach local "$$u" --user "$$u" 2>&1)" || case "$$out" in
+            *already*) ;;
+            *) echo "$$out" >&2; exit 1 ;;
+          esac
+          accounts="$$(mc admin user svcacct ls --json local "$$u")"
+          [ -z "$$accounts" ] || { echo "bootstrap: user $$u owns a service account — remove it with 'mc admin user svcacct rm' (ADR-135, CVE-2025-62506); refusing to complete" >&2; exit 1; }
+        done
+        echo 'media-public (anonymous download) + media-private buckets ready; identities media-presign (policy media-presign) and media-service (policy media-service) converged'
 
   # ---- stage-1 mail capture (BR-25, AC-7) — viewer at mail.{DOMAIN} behind basic auth --------
   # The development compose's existing pin, reused. SMTP (1025) and the viewer (8025) are
