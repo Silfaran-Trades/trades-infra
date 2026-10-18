@@ -8,8 +8,10 @@ following the `ai-standards` infra-repo convention (see
 
 - `docker-compose.yml` — shared **development** infrastructure that every service
   joins via the external `workspace-network`:
-  - `imresamu/postgis:18-3.6` (`trades-postgres`) — `trades_app` for the modular-monolith
-    backend (one schema per bundle) plus `media` for media-service
+  - `trades/postgres:18.6-postgis-3.6.4` (`trades-postgres`), the project's own image built
+    from `images/postgis/Dockerfile` (official `postgres:18.6-trixie` + PGDG PostGIS) —
+    `trades_app` for the modular-monolith backend (one schema per bundle) plus `media` for
+    media-service
   - `axllent/mailpit` (`trades-mailpit`) — dev SMTP capture
   - `clamav/clamav:1.5.4-debian13-slim` (`trades-clamav`) — media-service scan worker
   Image versions track `ai-standards/standards/tech-stack.md`. Owned/maintained by

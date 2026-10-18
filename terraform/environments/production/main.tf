@@ -8,8 +8,9 @@
 #     (BR-4, BR-5, BR-7). The boundary is attached to EVERY role this state
 #     creates — operator, agent, host, DLM (BR-5).
 #   - `backups-bucket` (NEW): the off-host dump copy + promotion records (BR-28, BR-24).
-#   - `registry`: five repositories, two of them the mirrored object-store images
-#     (BR-23, BR-33); the host's ECR read is scoped to exactly these ARNs.
+#   - `registry`: six repositories — the three deployables, the two mirrored object-store
+#     images (BR-23, BR-33) and the own postgres image; the host's ECR read is scoped to
+#     exactly these ARNs.
 #   - `cost-guardrails` CUT DOWN to the tag-filtered budget (BR-8): the billing
 #     alarm and the anomaly monitor are KHA Energy's account-wide ones (BR-9) —
 #     IA-007 deviation recorded in ADR-124.
@@ -86,8 +87,10 @@ module "registry" {
   source      = "../../modules/registry"
   project     = var.project
   environment = var.environment
-  # One repository per deployable (BR-23) + the two mirrored object-store images (BR-33).
-  repositories           = ["trades-backend", "media-service", "trades-front", "minio", "mc"]
+  # One repository per deployable (BR-23) + the two mirrored object-store images (BR-33) + the
+  # project's own PostgreSQL + PostGIS image (images/postgis/Dockerfile — upstream has no
+  # maintained arm64 PostGIS image; pushed by scripts/publish-postgres-image.sh, RUNBOOK.md).
+  repositories           = ["trades-backend", "media-service", "trades-front", "minio", "mc", "postgres"]
   lifecycle_repositories = ["trades-backend", "media-service", "trades-front"]
 }
 

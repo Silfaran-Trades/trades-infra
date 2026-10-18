@@ -20,13 +20,16 @@
 #   make rehearse-down    — tear it down
 #   make dast-baseline URL=https://app.trades.test   — passive ZAP baseline (AS-021 rung 1)
 #   make dast-high-check REPORT=… URL=…              — the High backstop alone, over a given report
+#   make container-scan IMAGE=…      — Trivy over a locally-built image (the own postgres image,
+#                           images/postgis): HIGH / CRITICAL with a fix available → exit 1 (AS-018)
 #   make infra-up / infra-down — the shared DEV stack (normally driven from ai-standards)
 
-.PHONY: quality shellcheck compose-config caddy-adapt actionlint image-pins gitleaks dast-baseline dast-high-check dast-high-selftest terraform-fmt terraform-validate tf-plan-check tf-plan-check-selftest mask-manifest mask-manifest-check rehearse rehearse-down infra-up infra-down web-login _require-docker _security-reports-dir
+.PHONY: container-scan quality shellcheck compose-config caddy-adapt actionlint image-pins gitleaks dast-baseline dast-high-check dast-high-selftest terraform-fmt terraform-validate tf-plan-check tf-plan-check-selftest mask-manifest mask-manifest-check rehearse rehearse-down infra-up infra-down web-login _require-docker _security-reports-dir
 
 SHELLCHECK_IMAGE ?= koalaman/shellcheck-alpine:v0.11.0@sha256:9955be09ea7f0dbf7ae942ac1f2094355bb30d96fffba0ec09f5432207544002
 ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
 GITLEAKS_IMAGE   ?= ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+TRIVY_IMAGE      ?= aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969
 ZAP_IMAGE        ?= ghcr.io/zaproxy/zaproxy:stable@sha256:781a2bdaea47324e7bab583e2263f21d257b0aee61ed51521a5be45f5f5081ef
 # Terraform >= 1.11 (native S3 locking, IA-001). The multi-arch index digest (arm64 dev
 # machine + amd64 CI runner share the line); re-resolve with `docker buildx imagetools inspect`.
@@ -51,7 +54,7 @@ _require-docker:
 SHELL_SCRIPTS := deploy/deploy.sh deploy/backup-postgres.sh deploy/restore-drill.sh deploy/host-sentinel.sh \
 	deploy/seed-synthetic.sh deploy/agent-db/generate-masked-views.sh deploy/agent-db/provision-agent-role.sh \
 	deploy/rehearsal/rehearse.sh \
-	scripts/promote.sh scripts/sync-host-deploy.sh scripts/mirror-object-store-images.sh \
+	scripts/promote.sh scripts/sync-host-deploy.sh scripts/mirror-object-store-images.sh scripts/publish-postgres-image.sh \
 	scripts/checks/check-compose-image-pins.sh scripts/checks/check-caddyfile.sh
 shellcheck: _require-docker
 	docker run --rm -v "$(CURDIR):/mnt:ro" -w /mnt $(SHELLCHECK_IMAGE) \
@@ -91,6 +94,26 @@ gitleaks: _require-docker
 	@test -f .gitleaks.toml || { echo "✗ .gitleaks.toml missing (the rehearsal scratch allowlist)"; exit 1; }
 	docker run --rm -v "$(CURDIR):/repo:ro" $(GITLEAKS_IMAGE) dir /repo --config /repo/.gitleaks.toml --redact --no-banner --exit-code 1
 	@echo "→ gitleaks: OK"
+
+# The image this repository BUILDS (images/postgis — the own PostgreSQL + PostGIS image) is
+# scanned like every deployable (AS-018): read from the local daemon through the socket, the DB
+# cached in the shared `trivy-cache` volume. scripts/publish-postgres-image.sh runs it before
+# any push; a finding is fixed by a version bump in the Dockerfile, never by an ignore — with ONE
+# documented exclusion: `usr/local/bin/gosu`, the official postgres image's privilege-drop helper.
+# It is a Go binary whose embedded stdlib always trails (25 net/http, crypto/tls, … findings on
+# 2026-10-18), but it only calls setuid/setgid and exec()s postgres before any of that code could
+# run — upstream's own position (github.com/tianon/gosu, "vulnerability scanners"). Every OS
+# package and the PostgreSQL / PostGIS binaries stay scanned.
+container-scan: _require-docker
+	@test -n "$(IMAGE)" || { echo "ERROR: pass IMAGE=… (a locally-built image, e.g. trades/postgres:18.6-postgis-3.6.4)"; exit 2; }
+	docker run --rm \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v trivy-cache:/root/.cache/trivy \
+		$(TRIVY_IMAGE) image \
+		--severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --no-progress \
+		--scanners vuln,secret --skip-files usr/local/bin/gosu \
+		"$(IMAGE)"
+	@echo "→ container scan: OK ($(IMAGE))"
 
 quality: shellcheck compose-config caddy-adapt actionlint image-pins gitleaks dast-high-selftest terraform-fmt terraform-validate tf-plan-check-selftest
 	@echo "→ infra quality: PASS"

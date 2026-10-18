@@ -24,7 +24,7 @@ output "registry" {
 }
 
 output "ecr_repository_urls" {
-  description = "name → URL of the five repositories (the three deployables + the mirrored minio / mc images)"
+  description = "name → URL of the six repositories (the three deployables + the mirrored minio / mc images + the own postgres image)"
   value       = module.registry.repository_urls
 }
 

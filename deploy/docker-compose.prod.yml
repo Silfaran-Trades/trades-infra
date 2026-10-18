@@ -217,7 +217,12 @@ services:
   # generated value; in production the runbook's rotation step changes both files together.
   mercure:
     <<: *service-defaults
-    image: dunglas/mercure:v0.16@sha256:0612e5cb86e276fba6df5bade62a0a2ef25051af270f8b569caf053be9c245ac
+    # v0.24.2 (Caddy 2.11.3): fixes CVE-2026-39972 (<0.22). Same 0.x protocol, same env names,
+    # the default Caddyfile still answers /healthz (the healthcheck below). Mercure 1.x is a
+    # breaking protocol change (at+jwt, cookie name, topic→match, no /healthz) and moves with
+    # mercure-bundle ≥0.6 in its own spec. A tag-only bump: deploy.sh starts the hub with
+    # --no-recreate, so a new pin is applied with RUNBOOK.md § "Pinned third-party image bump".
+    image: dunglas/mercure:v0.24.2@sha256:916834e499613d475e9ad5118cd2349875338f52d99d65b58aeff82f97ccb0c6
     env_file:
       - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/mercure.env
     environment:
@@ -450,6 +455,11 @@ services:
   # ---- PostgreSQL 18 + PostGIS — one instance, `trades_app` + `media` ------------------------
   postgres:
     <<: *service-defaults
+    # PostgreSQL 18.1 + PostGIS 3.6.1 (imresamu — tags frozen since 2026-02). Production moves to
+    # the project's OWN image (images/postgis/Dockerfile: PostgreSQL 18.6 + PostGIS 3.6.4, the
+    # image development runs) once the operator has pushed it to ECR and pinned the digest ECR
+    # reports HERE — `${REGISTRY:?…}/trades/postgres@sha256:…` — RUNBOOK.md § "PostgreSQL image
+    # upgrade". Never a tag, never a local build on the host.
     image: imresamu/postgis:18-3.6@sha256:b5766ee720aca09c61b9a868abefbf273348a4b90ad4cf146b4f8c9ac85d48e4
     env_file:
       - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/postgres.env   # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
