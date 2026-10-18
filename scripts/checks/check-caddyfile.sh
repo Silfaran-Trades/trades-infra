@@ -22,6 +22,16 @@
 #  10. no unconditional (non-`?`) Content-Security-Policy anywhere (CSP is application-emitted;
 #      the floor is a deferred default), and exactly ONE unconditional HSTS writer — the storage
 #      host's explicit block (BR-32 of 10.4)
+#  11. the storage filter (minio-storage-perimeter-hardening, ADR-135): on the storage host's
+#      main route, every named header refusal below and the negated allowlist expression are
+#      present and each answers through an `error` handler with status 403 (every `error`
+#      handler on that route is a 403 — no other status, no `respond`), the allowlist expression
+#      is present VERBATIM (the `^(` … `)?$` anchors, the closed `[0-9a-f-]{36}` / `[a-z_]+\.[a-z0-9]+`
+#      classes and the closed query alphabet included — a dropped anchor or a widened class
+#      fails here, proven by mutation), the nine family strips (`request_header -Family*`) are
+#      present, and the ORDER holds: refusals → allowlist → strip → the ONE `reverse_proxy`,
+#      which comes last. The other four hosts carry no `error` handler (the filter is the
+#      storage host's alone).
 #
 # Usage: scripts/checks/check-caddyfile.sh [deploy/Caddyfile]
 # Needs docker. Fails closed: no docker → red.
@@ -150,6 +160,91 @@ n_hsts_all="$(count "$json_reh" '"Strict-Transport-Security":["max-age=63072000;
 n_hsts_deferred="$(count "$json_reh" '"require":{"headers":{"Strict-Transport-Security":null}},"set":{"Strict-Transport-Security":[')"
 n_hsts_uncond=$((n_hsts_all - n_hsts_deferred))
 check "$([ "$n_hsts_uncond" = 1 ] && echo 0 || echo 1)" "exactly one unconditional Strict-Transport-Security writer — the storage host (found $n_hsts_uncond; $n_hsts_deferred deferred floor writers)"
+
+# 11. the storage filter (ADR-135) — read back out of the storage host's main route.
+# The named refusals: a presence matcher adapts to {"header":{"<Field>":["*"]}}, a value
+# matcher to {"header_regexp":{"<Field>":{"name":…,"pattern":"<re>"}}}. The list below IS the
+# contract: a name removed from the Caddyfile fails here; a name added there passes (the list
+# only ever grows — mirror it here in the same commit).
+STORAGE_REFUSED_PRESENT="Authorization X-Amz-Trailer X-Amz-Decoded-Content-Length \
+X-Amz-Meta-Snowball-Auto-Extract X-Amz-Meta-Minio-Snowball-Prefix X-Amz-Meta-Minio-Snowball-Ignore-Dirs X-Amz-Meta-Minio-Snowball-Ignore-Errors \
+X-Amz-Server-Side-Encryption X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id X-Amz-Server-Side-Encryption-Context \
+X-Amz-Server-Side-Encryption-Customer-Algorithm X-Amz-Server-Side-Encryption-Customer-Key X-Amz-Server-Side-Encryption-Customer-Key-Md5 \
+X-Amz-Server-Side-Encryption-Bucket-Key-Enabled X-Amz-Copy-Source X-Amz-Copy-Source-Range X-Amz-Metadata-Directive X-Amz-Replication-Status \
+X-Amz-Object-Lock-Mode X-Amz-Object-Lock-Retain-Until-Date X-Amz-Object-Lock-Legal-Hold \
+X-Amz-Tagging X-Amz-Tagging-Directive X-Amz-Acl X-Amz-Grant-Read X-Amz-Grant-Write X-Amz-Grant-Read-Acp \
+X-Amz-Grant-Write-Acp X-Amz-Grant-Full-Control X-Amz-Storage-Class X-Amz-Website-Redirect-Location \
+X-Amz-Security-Token X-Amz-Bypass-Governance-Retention \
+X-Minio-Source-Replication-Request X-Minio-Source-Replication-Check X-Minio-Source-Replication-Retention-Timestamp \
+X-Minio-Source-Replication-Legalhold-Timestamp X-Minio-Source-Replication-Tagging-Timestamp X-Minio-Source-Proxy-Request \
+X-Minio-Source-Mtime X-Minio-Source-Etag X-Minio-Source-Deletemarker \
+X-Minio-Replication-Server-Side-Encryption-Sealed-Key X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm \
+X-Minio-Replication-Server-Side-Encryption-Iv X-Minio-Replication-Actual-Object-Size X-Minio-Replication-Reset-Status \
+X-Minio-Replication-Ssec-Crc X-Minio-Replication-Delete-Status X-Minio-Replication-Deletemarker-Status \
+X-Minio-Replication-Encrypted-Multipart X-Minio-Replication-Ready X-Minio-Check-Replication-Ready \
+X-Minio-Force-Delete X-Minio-Force-Create X-Minio-Extract X-Minio-Fanout-List"
+STORAGE_STRIPPED="X-Minio-* X-Amz-Meta-Snowball* X-Amz-Meta-Minio-* X-Amz-Server-Side-Encryption* X-Amz-Copy-Source* X-Amz-Replication* X-Amz-Object-Lock* X-Amz-Grant-* X-Amz-Tagging*"
+# The allowlist expression, VERBATIM — the Caddyfile's CEL source between the backticks. A
+# presence check by fragments let a mutant with both anchors removed pass (second review pass);
+# this string is the contract: the `^(` … `)?$` anchors, the closed `[0-9a-f-]{36}` and
+# `[a-z_]+\.[a-z0-9]+` classes and the closed query alphabet. A deliberate change to the
+# expression edits the Caddyfile AND this string in the same commit.
+ALLOWLIST_EXPR=$(cat <<'CEL'
+method('GET', 'HEAD', 'PUT', 'OPTIONS') && {http.request.uri}.matches('^(/media-public/public/[0-9a-f-]{36}/[0-9a-f-]{36}/[a-z_]+\\.[a-z0-9]+|/media-public/public/[0-9a-f-]{36}/[a-z_]+\\.[a-z0-9]+|/media-private/private/[0-9a-f-]{36}/[0-9a-f-]{36}/[a-z_]+\\.[a-z0-9]+)(\\?((?i:x-amz-(algorithm|credential|date|expires|signedheaders|signature))=[A-Za-z0-9%._~-]*|(?i:x-amz-content-sha256)=UNSIGNED-PAYLOAD|(?i:x-amz-meta-asset-id)=[0-9a-f-]{36})(&((?i:x-amz-(algorithm|credential|date|expires|signedheaders|signature))=[A-Za-z0-9%._~-]*|(?i:x-amz-content-sha256)=UNSIGNED-PAYLOAD|(?i:x-amz-meta-asset-id)=[0-9a-f-]{36}))*)?$')
+CEL
+)
+# Its shape in the adapted JSON: Go's encoder writes `&` as backslash-u-0-0-2-6 (built from
+# octal bytes like GT above, never typed — two backslashes in a sed replacement emit one) and
+# doubles every backslash of the Caddyfile token (the CEL string escapes). sed's replacement
+# grammar is the same on BSD and GNU; awk's is not (BSD awk keeps `\\` literally).
+json_expr() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/&/$(printf '\134\134')u0026/g"; }
+storage_main="$(segment storage main)"
+missing=""; n_present=0
+for h in $STORAGE_REFUSED_PRESENT; do
+  if [ "$(count "$storage_main" "{\"header\":{\"${h}\":[\"*\"]}}")" -ge 1 ]; then n_present=$((n_present + 1)); else missing="$missing $h"; fi
+done
+check "$([ -z "$missing" ] && echo 0 || echo 1)" "storage.: every named header refusal present as a presence matcher ($n_present found${missing:+; missing:$missing})"
+n_sha="$(count "$storage_main" '"header_regexp":{"X-Amz-Content-Sha256":{"name":"refuse_streaming_sha","pattern":"(?i)^STREAMING-"}}')"
+n_enc="$(count "$storage_main" '"header_regexp":{"Content-Encoding":{"name":"refuse_aws_chunked","pattern":"(?i)aws-chunked"}}')"
+check "$([ "$n_sha" = 1 ] && [ "$n_enc" = 1 ] && echo 0 || echo 1)" "storage.: the STREAMING-* content-hash and aws-chunked value refusals present (case-insensitive regexps)"
+# the allowlist: one negated CEL expression over the method and the raw URI, naming the four
+# methods, the three minted key shapes and the one accepted content hash
+n_not="$(count "$storage_main" '{"not":[{"expression":"method('"'"'GET'"'"', '"'"'HEAD'"'"', '"'"'PUT'"'"', '"'"'OPTIONS'"'"')')"
+n_uri="$(count "$storage_main" '{http.request.uri}.matches(')"
+n_pub="$(count "$storage_main" '/media-public/public/[0-9a-f-]{36}/[0-9a-f-]{36}/[a-z_]+')"
+n_alias="$(count "$storage_main" '/media-public/public/[0-9a-f-]{36}/[a-z_]+')"
+n_priv="$(count "$storage_main" '/media-private/private/[0-9a-f-]{36}/[0-9a-f-]{36}/[a-z_]+')"
+n_unsigned="$(count "$storage_main" '(?i:x-amz-content-sha256)=UNSIGNED-PAYLOAD')"
+check "$([ "$n_not" = 1 ] && [ "$n_uri" = 1 ] && [ "$n_pub" -ge 1 ] && [ "$n_alias" -ge 1 ] && [ "$n_priv" -ge 1 ] && [ "$n_unsigned" -ge 1 ] && echo 0 || echo 1)" "storage.: ONE negated allowlist expression over method + raw URI naming GET/HEAD/PUT/OPTIONS, the three object-key shapes and UNSIGNED-PAYLOAD (not=$n_not uri=$n_uri shapes=$n_pub/$n_alias/$n_priv unsigned=$n_unsigned)"
+# … and VERBATIM: anchors, closed classes, closed query alphabet — exactly one such expression
+n_exact="$(count "$storage_main" "\"expression\":\"$(json_expr "$ALLOWLIST_EXPR")\"")"
+check "$([ "$n_exact" = 1 ] && echo 0 || echo 1)" "storage.: the allowlist expression is VERBATIM the contracted one — '^(' … ')?\$' anchors, [0-9a-f-]{36} / [a-z_]+\\.[a-z0-9]+ classes, the query alphabet (exact matches=$n_exact, need 1)"
+# every error handler on the route is a 403, and there are as many as refusals + the allowlist
+n_err="$(count "$storage_main" '"handler":"error"')"
+n_err_403="$(count "$storage_main" '"handler":"error","status_code":403}')"
+n_expected=$((n_present + 2 + 1))   # presence refusals + the two value refusals + the allowlist
+check "$([ "$n_err" = "$n_err_403" ] && [ "$n_err" = "$n_expected" ] && echo 0 || echo 1)" "storage.: every refusal answers through an error handler with status 403 (error=$n_err 403=$n_err_403 expected=$n_expected)"
+# the family strip
+missing=""
+for f in $STORAGE_STRIPPED; do
+  [ "$(count "$storage_main" "\"request\":{\"delete\":[\"${f}\"]}")" -ge 1 ] || missing="$missing $f"
+done
+check "$([ -z "$missing" ] && echo 0 || echo 1)" "storage.: the nine family strips present (request_header -Family*)${missing:+ (missing:$missing)}"
+# the order: refusals → allowlist → strip → the one reverse_proxy, last. Byte offsets inside
+# the one-line route (awk's index is 1-based; 0 = absent).
+pos() { printf '%s' "$1" | awk -v s="$2" '{ print index($0, s); exit }'; }
+p_err="$(pos "$storage_main" '"handler":"error"')"
+p_expr="$(pos "$storage_main" '"expression"')"
+p_strip="$(pos "$storage_main" '"request":{"delete":["X-Minio-*"]}')"
+p_proxy="$(pos "$storage_main" '"handler":"reverse_proxy"')"
+n_proxy="$(count "$storage_main" '"handler":"reverse_proxy"')"
+check "$([ "$p_err" -gt 0 ] && [ "$p_expr" -gt "$p_err" ] && [ "$p_strip" -gt "$p_expr" ] && [ "$p_proxy" -gt "$p_strip" ] && [ "$n_proxy" = 1 ] && echo 0 || echo 1)" "storage.: order refusals → allowlist → strip → the one reverse_proxy, last (offsets $p_err < $p_expr < $p_strip < $p_proxy; proxies=$n_proxy)"
+# the filter is the storage host's alone
+for host in $HOSTS; do
+  [ "$host" = storage ] && continue
+  n="$(count "$(segment "$host" main)" '"handler":"error"')"
+  check "$([ "$n" = 0 ] && echo 0 || echo 1)" "${host}.: no error handler (the storage filter does not leak onto this host; found $n)"
+done
 
 if [ "$fails" -gt 0 ]; then
   echo "✗ check-caddyfile: $fails check(s) failed" >&2

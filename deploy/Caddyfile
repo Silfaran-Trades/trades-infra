@@ -225,6 +225,62 @@ media.{$DOMAIN} {
 # them after the upstream response so an upstream header of the same name is replaced,
 # never duplicated (exactly once). The explicit set below wins over the floor's deferred
 # `?` defaults, so each header keeps one writer. No CSP (no HTML is served here), no COEP.
+#
+# THE STORAGE FILTER (minio-storage-perimeter-hardening, ADR-135): MinIO RELEASE.2025-09-07 is
+# the last community release and will never be patched (ADR-126). The `route` below is what
+# decides whether a request reaches it, in WRITTEN order (a route runs its directives as
+# written, not in the directive-order table):
+#   1. NAMED REFUSALS → `error 403` (BR-1, BR-2, BR-5). Each is born in the error lane below:
+#      body `403 Forbidden`, the six floor headers, `Cache-Control: private, no-store`, no
+#      upstream connection (BR-8). Header NAMES are matched case-insensitively by Caddy;
+#      VALUES with `(?i)` regexps. `header_regexp` and `header` check EVERY line of a repeated
+#      header (measured on the pinned image: a second `X-Amz-Content-Sha256: STREAMING-…` line
+#      after an `UNSIGNED-PAYLOAD` one is refused).
+#   2. THE POSITIVE ALLOWLIST → `error 403` when it does not hold (BR-3, BR-4, BR-6). ONE CEL
+#      expression, negated, over the method and the RAW request URI (`{http.request.uri}`:
+#      path + query exactly as sent — nothing is decoded first, so an encoded form can only
+#      fail it). Path: an object key of `media-public` / `media-private` in the shapes
+#      media-service mints (`AssetObjectKey`: `{visibility}/{owner}/{asset}/{leaf}`;
+#      `AssetPublicAliasKey`: `public/{asset}/{leaf}`, ADR-123) — no `%`, no `..`, no empty
+#      segment can match. Query: absent, or `&`-separated pairs that are each a presigned
+#      SigV4 key with a value in `[A-Za-z0-9%._~-]`, `X-Amz-Content-Sha256=UNSIGNED-PAYLOAD`
+#      (the ONLY content hash a presigned URL carries — every `STREAMING-*` form fails here)
+#      or `x-amz-meta-asset-id=<uuid>` (the SDK hoists the signed metadata into the query).
+#      Key names are case-insensitive, a repeated key is checked each time, a `;`, a bare key
+#      or any sub-resource key (`uploads`, `select`, `acl`, `delete`, `versionId`, …) fails.
+#      The bucket names are LITERAL here — renaming a bucket is a change to this file in the
+#      same commit (spec § Open Questions).
+#   3. THE FAMILY STRIP (`request_header -Family*`, BR-2 refined): Caddy cannot match a header
+#      NAME by prefix (measured — `header X-Minio-* *` never matches), so the named members of
+#      each family are refused above and whatever else carries one of these prefixes is
+#      removed before the proxy — MinIO never receives it either way.
+#   4. `reverse_proxy storage:9000`, unchanged.
+# The named-refusal lists were checked against the pinned release's header constants — read
+# out of the pinned binary's string table (`strings` over `/usr/bin/minio` of
+# RELEASE.2025-09-07T16-13-09Z, 2026-10-18), since the source tree is not in the image. Every
+# name the spec lists is present there, and these source / replication / internal names
+# found there were ADDED (the spec's "the list only ever grows"):
+# `X-Minio-Source-Replication-Retention-Timestamp`, `X-Minio-Source-Replication-Legalhold-Timestamp`,
+# `X-Minio-Source-Replication-Tagging-Timestamp`, `X-Minio-Replication-Reset-Status`,
+# `X-Minio-Replication-Ssec-Crc`, `X-Minio-Replication-Delete-Status`,
+# `X-Minio-Replication-Deletemarker-Status`, `X-Minio-Replication-Encrypted-Multipart`,
+# `X-Minio-Replication-Ready`, `X-Minio-Check-Replication-Ready`, `X-Minio-Force-Create`,
+# `X-Minio-Extract`, `X-Minio-Fanout-List`, `X-Amz-Server-Side-Encryption-Bucket-Key-Enabled`;
+# the `X-Minio-Internal-*` family (thirty-odd names) and the `X-Amz-Copy-Source-*` conditions
+# ride the family strip. The legitimate flow (spec BR-7, evidence § 1) sends NONE of these, and
+# every recorded shape passes the allowlist unchanged (evidence § 5).
+# ADDED by the second review pass (the list only ever grows): the generic S3 write-side headers
+# that a holder of a valid presigned URL could otherwise hand to the store — `X-Amz-Tagging`,
+# `X-Amz-Tagging-Directive`, `X-Amz-Acl`, the five `X-Amz-Grant-*` (`-Read`, `-Write`,
+# `-Read-Acp`, `-Write-Acp`, `-Full-Control`), `X-Amz-Storage-Class`,
+# `X-Amz-Website-Redirect-Location`, `X-Amz-Security-Token` (an STS session token — the
+# identities are plain users, never STS, ADR-135) and `X-Amz-Bypass-Governance-Retention`;
+# every name read from the same string table, and the `X-Amz-Grant-*` / `X-Amz-Tagging*` families
+# stripped below them. No recorded shape sends any of them: the SDK signs exactly
+# `Content-Type` + `x-amz-meta-asset-id` on a PUT (`S3ObjectStorage::presignPutUrl`), the SPA and
+# the seed lane send the `upload_headers` list verbatim, a GET / HEAD sends none (evidence § 1).
+# The development stack has no perimeter in front of MinIO and gets no filter (BR-9).
+# scripts/checks/check-caddyfile.sh reads this route back out of the adapted JSON (check 11).
 storage.{$DOMAIN} {
 	tls {$CADDY_TLS_ARG}
 	import access-log
@@ -241,7 +297,157 @@ storage.{$DOMAIN} {
 		-Server
 		defer
 	}
-	reverse_proxy storage:9000
+	route {
+		# 1. named refusals — the header-signed S3 API never crosses the perimeter (BR-5)
+		@refuse_authorization header Authorization *
+		error @refuse_authorization 403
+		# 1. named refusals — the unsigned-trailer / streaming upload path, CVE-2026-41145 and
+		#    CVE-2026-40344's precondition (BR-1)
+		@refuse_streaming_sha header_regexp X-Amz-Content-Sha256 (?i)^STREAMING-
+		error @refuse_streaming_sha 403
+		@refuse_trailer header X-Amz-Trailer *
+		error @refuse_trailer 403
+		@refuse_decoded_length header X-Amz-Decoded-Content-Length *
+		error @refuse_decoded_length 403
+		@refuse_aws_chunked header_regexp Content-Encoding (?i)aws-chunked
+		error @refuse_aws_chunked 403
+		# 1. named refusals — the Snowball auto-extract handler, CVE-2026-40344 (BR-2)
+		@refuse_snowball header X-Amz-Meta-Snowball-Auto-Extract *
+		error @refuse_snowball 403
+		@refuse_snowball_prefix header X-Amz-Meta-Minio-Snowball-Prefix *
+		error @refuse_snowball_prefix 403
+		@refuse_snowball_ignore_dirs header X-Amz-Meta-Minio-Snowball-Ignore-Dirs *
+		error @refuse_snowball_ignore_dirs 403
+		@refuse_snowball_ignore_errors header X-Amz-Meta-Minio-Snowball-Ignore-Errors *
+		error @refuse_snowball_ignore_errors 403
+		# 1. named refusals — server-side encryption, copy, replication and object-lock
+		#    metadata injection, the CVE-2026-34204 class (BR-2)
+		@refuse_sse header X-Amz-Server-Side-Encryption *
+		error @refuse_sse 403
+		@refuse_sse_kms_key header X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id *
+		error @refuse_sse_kms_key 403
+		@refuse_sse_context header X-Amz-Server-Side-Encryption-Context *
+		error @refuse_sse_context 403
+		@refuse_sse_c_algorithm header X-Amz-Server-Side-Encryption-Customer-Algorithm *
+		error @refuse_sse_c_algorithm 403
+		@refuse_sse_c_key header X-Amz-Server-Side-Encryption-Customer-Key *
+		error @refuse_sse_c_key 403
+		@refuse_sse_c_key_md5 header X-Amz-Server-Side-Encryption-Customer-Key-Md5 *
+		error @refuse_sse_c_key_md5 403
+		@refuse_sse_bucket_key header X-Amz-Server-Side-Encryption-Bucket-Key-Enabled *
+		error @refuse_sse_bucket_key 403
+		@refuse_copy_source header X-Amz-Copy-Source *
+		error @refuse_copy_source 403
+		@refuse_copy_source_range header X-Amz-Copy-Source-Range *
+		error @refuse_copy_source_range 403
+		@refuse_metadata_directive header X-Amz-Metadata-Directive *
+		error @refuse_metadata_directive 403
+		@refuse_replication_status header X-Amz-Replication-Status *
+		error @refuse_replication_status 403
+		@refuse_lock_mode header X-Amz-Object-Lock-Mode *
+		error @refuse_lock_mode 403
+		@refuse_lock_retain header X-Amz-Object-Lock-Retain-Until-Date *
+		error @refuse_lock_retain 403
+		@refuse_lock_legal_hold header X-Amz-Object-Lock-Legal-Hold *
+		error @refuse_lock_legal_hold 403
+		# 1. named refusals — the generic S3 write-side headers no recorded shape sends: object
+		#    tagging, canned / explicit ACL grants, storage class, website redirect, an STS session
+		#    token and the governance-retention bypass (BR-2, "the list only ever grows")
+		@refuse_tagging header X-Amz-Tagging *
+		error @refuse_tagging 403
+		@refuse_tagging_directive header X-Amz-Tagging-Directive *
+		error @refuse_tagging_directive 403
+		@refuse_acl header X-Amz-Acl *
+		error @refuse_acl 403
+		@refuse_grant_read header X-Amz-Grant-Read *
+		error @refuse_grant_read 403
+		@refuse_grant_write header X-Amz-Grant-Write *
+		error @refuse_grant_write 403
+		@refuse_grant_read_acp header X-Amz-Grant-Read-Acp *
+		error @refuse_grant_read_acp 403
+		@refuse_grant_write_acp header X-Amz-Grant-Write-Acp *
+		error @refuse_grant_write_acp 403
+		@refuse_grant_full_control header X-Amz-Grant-Full-Control *
+		error @refuse_grant_full_control 403
+		@refuse_storage_class header X-Amz-Storage-Class *
+		error @refuse_storage_class 403
+		@refuse_website_redirect header X-Amz-Website-Redirect-Location *
+		error @refuse_website_redirect 403
+		@refuse_security_token header X-Amz-Security-Token *
+		error @refuse_security_token 403
+		@refuse_bypass_governance header X-Amz-Bypass-Governance-Retention *
+		error @refuse_bypass_governance 403
+		# 1. named refusals — MinIO's internal, source and replication headers (BR-2)
+		@refuse_minio_src_repl_request header X-Minio-Source-Replication-Request *
+		error @refuse_minio_src_repl_request 403
+		@refuse_minio_src_repl_check header X-Minio-Source-Replication-Check *
+		error @refuse_minio_src_repl_check 403
+		@refuse_minio_src_repl_retention header X-Minio-Source-Replication-Retention-Timestamp *
+		error @refuse_minio_src_repl_retention 403
+		@refuse_minio_src_repl_legalhold header X-Minio-Source-Replication-Legalhold-Timestamp *
+		error @refuse_minio_src_repl_legalhold 403
+		@refuse_minio_src_repl_tagging header X-Minio-Source-Replication-Tagging-Timestamp *
+		error @refuse_minio_src_repl_tagging 403
+		@refuse_minio_src_proxy header X-Minio-Source-Proxy-Request *
+		error @refuse_minio_src_proxy 403
+		@refuse_minio_src_mtime header X-Minio-Source-Mtime *
+		error @refuse_minio_src_mtime 403
+		@refuse_minio_src_etag header X-Minio-Source-Etag *
+		error @refuse_minio_src_etag 403
+		@refuse_minio_src_deletemarker header X-Minio-Source-Deletemarker *
+		error @refuse_minio_src_deletemarker 403
+		@refuse_minio_repl_sealed_key header X-Minio-Replication-Server-Side-Encryption-Sealed-Key *
+		error @refuse_minio_repl_sealed_key 403
+		@refuse_minio_repl_seal_algorithm header X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm *
+		error @refuse_minio_repl_seal_algorithm 403
+		@refuse_minio_repl_iv header X-Minio-Replication-Server-Side-Encryption-Iv *
+		error @refuse_minio_repl_iv 403
+		@refuse_minio_repl_actual_size header X-Minio-Replication-Actual-Object-Size *
+		error @refuse_minio_repl_actual_size 403
+		@refuse_minio_repl_reset header X-Minio-Replication-Reset-Status *
+		error @refuse_minio_repl_reset 403
+		@refuse_minio_repl_ssec_crc header X-Minio-Replication-Ssec-Crc *
+		error @refuse_minio_repl_ssec_crc 403
+		@refuse_minio_repl_delete_status header X-Minio-Replication-Delete-Status *
+		error @refuse_minio_repl_delete_status 403
+		@refuse_minio_repl_deletemarker_status header X-Minio-Replication-Deletemarker-Status *
+		error @refuse_minio_repl_deletemarker_status 403
+		@refuse_minio_repl_encrypted_multipart header X-Minio-Replication-Encrypted-Multipart *
+		error @refuse_minio_repl_encrypted_multipart 403
+		@refuse_minio_repl_ready header X-Minio-Replication-Ready *
+		error @refuse_minio_repl_ready 403
+		@refuse_minio_check_repl_ready header X-Minio-Check-Replication-Ready *
+		error @refuse_minio_check_repl_ready 403
+		@refuse_minio_force_delete header X-Minio-Force-Delete *
+		error @refuse_minio_force_delete 403
+		@refuse_minio_force_create header X-Minio-Force-Create *
+		error @refuse_minio_force_create 403
+		@refuse_minio_extract header X-Minio-Extract *
+		error @refuse_minio_extract 403
+		@refuse_minio_fanout header X-Minio-Fanout-List *
+		error @refuse_minio_fanout 403
+		# 2. the positive allowlist (BR-3, BR-4, BR-6) — method ∈ {GET, HEAD, PUT, OPTIONS} AND the
+		#    raw URI is one object key in one of the three minted shapes with an all-presigned
+		#    query (or none). Anything else is refused. Keep this expression and check 11 of
+		#    check-caddyfile.sh in step: the check asserts it VERBATIM (a dropped anchor or a
+		#    widened class fails `make quality`; a deliberate change edits both files in the same
+		#    commit), the rehearsal probes (scripts/tests/storage-perimeter.test.sh) prove what it
+		#    refuses and passes.
+		@not_allowlisted not expression `method('GET', 'HEAD', 'PUT', 'OPTIONS') && {http.request.uri}.matches('^(/media-public/public/[0-9a-f-]{36}/[0-9a-f-]{36}/[a-z_]+\\.[a-z0-9]+|/media-public/public/[0-9a-f-]{36}/[a-z_]+\\.[a-z0-9]+|/media-private/private/[0-9a-f-]{36}/[0-9a-f-]{36}/[a-z_]+\\.[a-z0-9]+)(\\?((?i:x-amz-(algorithm|credential|date|expires|signedheaders|signature))=[A-Za-z0-9%._~-]*|(?i:x-amz-content-sha256)=UNSIGNED-PAYLOAD|(?i:x-amz-meta-asset-id)=[0-9a-f-]{36})(&((?i:x-amz-(algorithm|credential|date|expires|signedheaders|signature))=[A-Za-z0-9%._~-]*|(?i:x-amz-content-sha256)=UNSIGNED-PAYLOAD|(?i:x-amz-meta-asset-id)=[0-9a-f-]{36}))*)?$')`
+		error @not_allowlisted 403
+		# 3. the family strip — an unnamed member of a refused family never reaches MinIO
+		request_header -X-Minio-*
+		request_header -X-Amz-Meta-Snowball*
+		request_header -X-Amz-Meta-Minio-*
+		request_header -X-Amz-Server-Side-Encryption*
+		request_header -X-Amz-Copy-Source*
+		request_header -X-Amz-Replication*
+		request_header -X-Amz-Object-Lock*
+		request_header -X-Amz-Grant-*
+		request_header -X-Amz-Tagging*
+		# 4. the store
+		reverse_proxy storage:9000
+	}
 	import error_lane
 }
 

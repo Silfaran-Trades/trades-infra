@@ -70,7 +70,7 @@ region         = eu-south-2
 | `mercure` | `dunglas/mercure:v0.16` | Chat's SSE hub, served at `api.{domain}/.well-known/mercure` | `/healthz` |
 | `media` | `${REGISTRY}/trades/media-service:{MEDIA_TAG}` | media-service HTTP + its `scan-worker` and `process-worker` under supervisord | `GET /api/health` (bucket probe) **and** both workers `RUNNING` |
 | `clamav` | `clamav/clamav:1.5.4-debian13-slim` (multi-arch digest; the bare `1.5.4` tag is amd64-only) | the antivirus daemon | `clamdscan --ping` |
-| `storage` (+ `storage-init`) | `${REGISTRY}/trades/minio@sha256:…` / `…/mc@sha256:…` (ADR-126) | the object store (synthetic media only in stage 1); public endpoint `storage.{domain}` | `/minio/health/live`; `storage-init` exited 0 |
+| `storage` (+ `storage-init`) | `${REGISTRY}/trades/minio@sha256:…` / `…/mc@sha256:…` (ADR-126) | the object store (synthetic media only in stage 1); public endpoint `storage.{domain}` behind the perimeter's storage filter (ADR-135); `storage-init` converges the two buckets AND the two least-privilege users `media-presign` / `media-service` media-service runs as — root stays in `storage.env` only (§ "Object storage identities and the root rotation") | `/minio/health/live`; `storage-init` exited 0 |
 | `mailpit` | `axllent/mailpit:v1.31.2` | stage-1 mail capture: every message the platform sends, nothing leaves the host; viewer at `mail.{domain}` behind basic auth; bounded 500 messages / 14 days | `mailpit readyz` |
 | `postgres` | `imresamu/postgis:18-3.6` | one instance: `trades_app` (one schema per bundle) + `media` | `pg_isready` |
 | `web` | `${REGISTRY}/trades/trades-front:{WEB_TAG}` | the SPA (static, unprivileged nginx) | `GET /` |
@@ -311,7 +311,8 @@ CREATE, so every rotation ends with a `--force-recreate` of the readers:
 | JWT key pair | `/srv/trades/secrets/files/` (mounted read-only at `/run/secrets/files/`) | two-key window (`secrets.md` § Key material): the new PUBLIC key reaches `media` BEFORE the app signs with the new private key |
 | Mercure keys | the `app` AND `mercure` parameters — same value in both | change both, recreate `app`, the workers and `mercure` together; a mismatch is silent |
 | Postgres password | the `postgres` parameter + `DATABASE_URL` in `app` and `media` | `ALTER USER` first, then the three parameters, then recreate |
-| MinIO root credentials | the `storage` parameter + `MEDIA_STORAGE_DSN` in `media` | rotate in MinIO, then the parameters, then recreate `media` |
+| MinIO root credentials (`MINIO_ROOT_USER` **and** `MINIO_ROOT_PASSWORD` — both: the user name is the access key id, and a published key id stays valid for the unfixed CVE paths when only the password changes) | the `storage` parameter ONLY — root is held by `storage` and `storage-init` and by nothing else (ADR-135) | `on-incident` plus yearly: rewrite the `storage` parameter (both values), `fetch-secrets.sh`, `up -d --force-recreate storage storage-init`; MinIO's users, policies, buckets and objects survive a root change (measured). The full ordered procedure with its checks and back-outs: § "Object storage identities and the root rotation (stage 1)" |
+| the two MinIO identities `media-presign` / `media-service` (`MEDIA_STORAGE_PRESIGN_SECRET_KEY`, `MEDIA_STORAGE_SERVICE_SECRET_KEY`) | the `storage` parameter (where `storage-init` reads them to converge the users) AND the `media` parameter (the same presign value under the same name, the service value inside `MEDIA_STORAGE_DSN`) — one value in two files, like the Mercure keys | `scheduled:1y` plus `on-incident`: rewrite BOTH parameters with the same new values, `fetch-secrets.sh`, `up -d --force-recreate storage-init` (exit 0 — it resets each user's secret to the configured value), then recreate `media`; a mismatch between the two files is loud, not silent — `media`'s `headBucket` is refused, `/api/health` answers `503` and the promotion gate stops, or every upload fails with `SignatureDoesNotMatch` |
 | the backup `age` key pair | recipient in `/srv/trades/secrets/backup-age.recipient`; the identity OFF-HOST in the SSM SecureString `/trades/production/operator/backup-age-key` | generate a new pair, update the recipient, keep the OLD identity until every dump encrypted with it has aged out (14 days) |
 | the basic-auth credential | `deploy/.env` on the host (hash) + `/trades/production/operator/web-login` | `caddy hash-password`, single-quote it, `up -d caddy` (above) |
 | `ai_readonly` (the agent role) | `/srv/trades/secrets/ai-readonly.env` + the `/trades/production/agent/database-url` parameter | re-run `agent-db/provision-agent-role.sh` with the new value, rewrite the parameter |
@@ -319,6 +320,126 @@ CREATE, so every rotation ends with a `--force-recreate` of the readers:
 
 The host holds **no registry token** (the instance profile pulls through the ECR credential
 helper, BR-23) and no cloud key of any kind (TM-10).
+
+## Object storage identities and the root rotation (stage 1)
+
+Spec `Deployment/minio-storage-perimeter-hardening` (ADR-135). Stage 1 runs the last MinIO
+community release, which will never be patched; six advisories affect it, two of them object
+writes that need only a **valid access key** — and until this item media-service signed every
+presigned URL with the root credentials, so the root access key id was in every URL the SPA
+received. Three things change, in this order of urgency:
+
+- the perimeter's `storage.` site refuses the request shapes of the CVEs and everything the
+  presigned flow never sends (`deploy/Caddyfile`, the `route` in the storage block; read back by
+  `scripts/checks/check-caddyfile.sh` check 11) — **step 0**, independent of everything else;
+- media-service signs as the plain MinIO user `media-presign` and works as `media-service`, both
+  created by `storage-init` with a named policy and an explicit `Deny admin:*`; root exists only
+  in `storage.env` — **steps 1–2**. `media-presign` holds `GetObject` + `PutObject` on the minted
+  prefixes (S3 has no separate copy permission — a server-side `CopyObject` is Get on the source
+  plus Put on the destination, so the policy also carries an explicit `Deny` of `PutObject` when
+  `x-amz-copy-source` is present, measured on the pinned release); the boundary that matters is
+  that its secret never leaves media-service and that the perimeter refuses and strips
+  `X-Amz-Copy-Source` (step 0);
+- stage 1's exposed root key is rotated, **user name and password** — **steps 3–5**.
+
+Every store-side action and every check below is what the rehearsal runs for real on a populated
+scratch stack (the rows marked *rehearsal substitute* say with what); the lanes that exist only
+on stage 1 — the SSM writes, `sync-host-deploy.sh`, `promote.sh` — are walked line by line there.
+Nothing in this item touches the host: the whole procedure is the **operator's** act (IA-010).
+Dates go in the checklist at the end.
+
+Conventions: Mac commands run from a clean `trades-infra` `master` equal to `origin/master` with
+`AWS_PROFILE=trades-prod`; host commands run as `deploy` in `/srv/trades/deploy` (`C="docker
+compose -f docker-compose.prod.yml"`); a one-off `mc` is `$C run --rm --entrypoint sh storage-init -c '…'`
+(the bootstrap's own image, with `storage.env` in its environment — `mc alias set local
+http://storage:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"` first). Parameters are written
+from a local throwaway file, never a value on the command line (BR-26b):
+`aws ssm put-parameter --region eu-south-2 --name /trades/production/env/<name> --type SecureString --tier Intelligent-Tiering --overwrite --value file://<name>.env`.
+SSM keeps every previous version (`aws ssm get-parameter-history --name … --with-decryption`);
+that history is the back-out source named below.
+
+### Step 0 — the perimeter filter (first, on its own)
+
+| | |
+|---|---|
+| Do | Mac: `scripts/sync-host-deploy.sh` (the new `Caddyfile`, `docker-compose.prod.yml` and `RUNBOOK.md` land; the sync keeps `/srv/trades/deploy.bak-<ts>`). Host: `$C restart caddy` (the Caddyfile is bind-mounted — the **content** lane of § "The two Caddy lanes"). *Rehearsal substitute:* copy the committed `deploy/` into the scratch `deploy/` (what `rehearse.sh up` does), then `restart caddy` on the scratch project. |
+| Check | From the Mac, against the live host: every refused class answers `403` with the perimeter's own plain-text body `403 Forbidden` and `Cache-Control: private, no-store`, and no object written. **Read the body, not only the status**: MinIO itself answers `403` (an XML `AccessDenied` body) to several of these shapes, so a status-only check also passes with the filter missing. `curl -sS -w ' %{http_code}\n' -X PUT -H 'X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER' https://storage.<base>/media-private/private/<uuid>/<uuid>/x.pdf`, the same with `-H 'X-Amz-Meta-Snowball-Auto-Extract: true'`, `-X POST '…?select&select-type=2'`, `-X DELETE`, `https://storage.<base>/`, `…/minio/health/live`, `-H 'Authorization: x'`; a public profile photo of a seeded professional (`https://storage.<base>/media-public/public/<asset>/medium.jpg`) still answers `200`; and a fresh upload through the SPA (sign in as a seeded professional, change the photo) completes. `scripts/tests/storage-perimeter.test.sh` runs the full set. |
+| Back out | Host: `cp /srv/trades/deploy.bak-<ts>/Caddyfile /srv/trades/deploy/Caddyfile && $C restart caddy`. The filter has no state. |
+| ⚠ | **No `promote.sh media` between step 0 and step 1.** The synced `docker-compose.prod.yml` already carries the new `storage-init`, which refuses to complete while `storage.env` lacks `MEDIA_STORAGE_PRESIGN_SECRET_KEY` / `MEDIA_STORAGE_SERVICE_SECRET_KEY` — a `media` promotion would re-run it, stop at the bootstrap, and leave `media` down. Step 1 seeds those two values first. |
+
+### Step 1 — the identities exist, media-service uses them (root still works)
+
+| | |
+|---|---|
+| Do | Mac: generate the two identity secrets once (`head -c 32 /dev/urandom \| od -An -tx1 \| tr -d ' \n'`, twice) into a throwaway `storage.env` = the current root pair **plus** `MEDIA_STORAGE_PRESIGN_SECRET_KEY=…` / `MEDIA_STORAGE_SERVICE_SECRET_KEY=…`, and a throwaway `media.env` = the current one with `MEDIA_STORAGE_DSN=s3://media-service:<service secret>@storage:9000?region=us-east-1&path_style=true`, `MEDIA_STORAGE_PRESIGN_ACCESS_KEY=media-presign`, `MEDIA_STORAGE_PRESIGN_SECRET_KEY=<presign secret>` — the same two values in both files; `put-parameter` both (`storage`, then `media`). Host: `/srv/trades/fetch-secrets.sh`; `$C up -d --force-recreate storage-init` and **require exit 0** (`docker wait "$($C ps -aq storage-init)"` prints it; it exits 1 naming the empty variable or the user that owns a service account); then Mac: `scripts/promote.sh media <sha>` — the first media image that carries this change. *Rehearsal substitute:* the scratch `secrets/storage.env` and `secrets/media.env` stand in for the two parameters and `fetch-secrets.sh`; `deploy.sh media <sha>` in the scratch tree stands in for `promote.sh`. |
+| Check | Host: `$C ps` shows `storage-init` exited 0 and `media` healthy; `grep -o 'MEDIA_STORAGE_DSN=s3://[^:]*' /srv/trades/secrets/media.env` prints `media-service` (the user part only — never print the rest); a one-off `mc`: `mc admin user ls local` lists `media-presign` and `media-service` enabled with their policies, `mc admin user svcacct ls local media-presign` and `… media-service` print `No service accounts found`. Then the step-2 check. |
+| Back out | **The media image and the `media` parameter roll back as a pair** — never one without the other: the previous image ignores the two presign variables and would sign with the DSN's identity, and this image on the previous DSN would sign as root. Before step 3: restore the previous `media` parameter version from the SSM history (the root DSN — it is still held there; step 5 deletes local copies only), `fetch-secrets.sh`, `promote.sh media <previous sha>`. The identities and the new `storage.env` can stay — root still works and they are inert. After step 3: only to an image that carries this change, with a DSN naming `media-service`. |
+
+### Step 2 — a fresh presigned URL names `media-presign`; an upload completes
+
+Repeat this check **after every recreate of `media`** (a promotion, a rollback, a rotation of the
+`media` parameter), and once more right before step 3.
+
+| | |
+|---|---|
+| Check | Browser, as a seeded professional: change the profile photo; in the network tab the presigned `PUT` to `storage.<base>` carries `X-Amz-Credential=media-presign%2F…` — never the root user name — and the upload completes, the photo appears (scan clean, variants rendered), and its public card URL answers `200`. Host, the same from the store's side: a one-off `mc` with `mc admin trace -v --call s3 local` running while the upload happens shows the presigned `PUT` under `media-presign` and media-service's own `HeadObject` / `PutObject` / `CopyObject` under `media-service`; nothing under the root user. |
+| Back out | None of its own — a failed check is the step-1 back-out (the pair). |
+
+### Step 3 — rotate root (user name **and** password); recreate the store and its bootstrap
+
+**At least 15 minutes after step 2's last verification**: a presigned URL minted before step 1
+was signed by root and keeps working until it expires (the longest TTL is 15 minutes); a rollback
+of `media` restarts the wait.
+
+| | |
+|---|---|
+| Do | Mac: a throwaway `storage.env` with a **new `MINIO_ROOT_USER`** (a fresh random name — the old one is the published key id) and a new `MINIO_ROOT_PASSWORD`, the two identity secrets unchanged; `put-parameter storage`. Host: `fetch-secrets.sh`; `$C up -d --force-recreate storage storage-init` (the store restarts with the new root — an upload in flight fails and the user retries; stage 1 holds synthetic data only — and the bootstrap re-converges under the new root, exit 0 required). *Rehearsal substitute:* the scratch `secrets/storage.env`, then the same `up -d --force-recreate` on the scratch project, on the populated volume. |
+| Check | Step 4, at once. |
+| Back out | Restore the previous `storage` parameter version from the SSM history, `fetch-secrets.sh`, `$C up -d --force-recreate storage storage-init`. MinIO's IAM data (users, policies, buckets, the anonymous policy) is not tied to the root credentials and survives a root change in both directions (measured at refinement on the pinned release). |
+
+### Step 4 — the old root is refused; everything else survives; an upload completes
+
+| | |
+|---|---|
+| Check | Host, a one-off `mc`: `mc alias set old http://storage:9000 <old root user> <old root password>` is refused (`Access Denied` / invalid credentials — the old pair is in the SSM history, use it from there once, never type it into a shell that keeps history); `mc alias set local …` with the new pair works; `mc admin user ls local` still lists both identities enabled with their policies; `mc ls local/media-public/public/` and `… media-private/private/` still list the objects; `mc anonymous get local/media-public` prints `download`; a public profile photo answers `200` through `storage.<base>`; `$C ps` shows `media` healthy. Then the whole of step 2 again (fresh URL under `media-presign`, upload end to end). |
+| Back out | Step 3's. |
+
+### Step 5 — remove every local copy
+
+| | |
+|---|---|
+| Do | Mac: delete the throwaway `storage.env` / `media.env` files of steps 1 and 3 (`rm -P` on macOS); nothing was pasted into a shell history or a password manager (the parameter store is the copy of record, as for every other row of § "Rotate a secret"). Host: nothing to delete — `fetch-secrets.sh` rewrote the two mode-600 files in place. The **old** root pair remains in the `storage` parameter's SSM version history (the step-3 back-out source); it is refused by the store after step 4, which is what makes that acceptable. |
+| Check | `ls` of the directory the throwaway files lived in; `history \| grep -c put-parameter` shows commands that name files, never values. |
+| Back out | Nothing to undo: deleting the local copies is irreversible by design, and nothing depends on them — the parameter store (`storage`, `media`) and its version history remain the copy of record for every value this procedure wrote, so a later step-1 or step-3 back-out reads from there, never from a local file. |
+
+### Operator checklist
+
+| Step | Done (UTC date, operator) | Notes |
+|---|---|---|
+| 0 — host sync + `restart caddy`; refused classes `403`, public read `200`, SPA upload completes | | |
+| 1 — `storage` + `media` parameters seeded with the two identities; `storage-init` exit 0; `promote.sh media <sha>` | | sha: |
+| 2 — fresh presigned URL names `media-presign`; upload end to end; nothing traced under root | | |
+| 3 — root rotated (user name + password); `storage` + `storage-init` recreated, bootstrap exit 0 (≥ 15 min after 2) | | |
+| 4 — old root refused; identities, buckets, objects, anonymous read survive; upload end to end | | |
+| 5 — local copies removed | | |
+
+Record the dates in `trades-docs/secrets-manifest.md` (`last_rotated` of the `MINIO_ROOT_*`,
+`MEDIA_STORAGE_PRESIGN_SECRET_KEY`, `MEDIA_STORAGE_SERVICE_SECRET_KEY` and `MEDIA_STORAGE_DSN` rows).
+
+### Development note — the three `.env` lines
+
+The development bootstrap (`media-service/docker-compose.yml`, `media-minio-init`) creates the
+same two users with the committed development values, and media-service's gitignored `.env`
+must name them — the root pair `minioadmin` is for the bootstrap and the admin console only:
+
+```bash
+MEDIA_STORAGE_DSN=s3://media-service:media-service-dev-secret@media-minio:9000?region=us-east-1&path_style=true
+MEDIA_STORAGE_PRESIGN_ACCESS_KEY=media-presign
+MEDIA_STORAGE_PRESIGN_SECRET_KEY=media-presign-dev-secret
+```
+
+`.env.example` and `.env.test` carry the same three lines. After editing `.env`: `docker compose
+up -d media-service` (an env file is read at container create — a `restart` keeps the old one).
 
 ## Backups, the off-host copy and the restore drill (BR-28, BR-30)
 
