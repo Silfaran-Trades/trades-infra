@@ -105,13 +105,13 @@ services:
 
   clamav:
     # Antivirus daemon consumed by media-service's scan worker (Slice 6.2).
-    # Pinned to 1.5.2-debian13-slim per SC-005 + AD-11 — :stable would track a
+    # Pinned to 1.5.4-debian13-slim per SC-005 + AD-11 — :stable would track a
     # moving target and a future signature-DB format change could silently
     # break operator dashboards on freshclam warnings. The -debian13-slim
     # variant is multi-arch (amd64 + arm64 + ppc64le) so Apple Silicon hosts
-    # run it natively; the bare `1.5.2` tag is Alpine-amd64-only.
+    # run it natively; the bare `1.5.x` tags are Alpine-amd64-only.
     # Digest-pinned (BR-2). Re-resolve with `docker buildx imagetools inspect clamav/clamav:<tag>`.
-    image: clamav/clamav:1.5.2-debian13-slim@sha256:14e2e0805c6a5ff6728ea591c05565e0f0954d93e8701919012c3a8c44e20674
+    image: clamav/clamav:1.5.4-debian13-slim@sha256:9a96980b265cb2b51a20bdcca921dc80aa55ed0e56cdfb076198ee27a9171927
     container_name: trades-clamav
     restart: unless-stopped
     ports:

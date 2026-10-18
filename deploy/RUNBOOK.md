@@ -69,7 +69,7 @@ region         = eu-south-2
 | `worker-scheduler` | same image, same tag | the nine `schedule://` transports carrying the registered jobs of `trades-docs/scheduled-jobs.md` | `php` is PID 1 |
 | `mercure` | `dunglas/mercure:v0.16` | Chat's SSE hub, served at `api.{domain}/.well-known/mercure` | `/healthz` |
 | `media` | `${REGISTRY}/trades/media-service:{MEDIA_TAG}` | media-service HTTP + its `scan-worker` and `process-worker` under supervisord | `GET /api/health` (bucket probe) **and** both workers `RUNNING` |
-| `clamav` | `clamav/clamav:1.5.2` | the antivirus daemon | `clamdscan --ping` |
+| `clamav` | `clamav/clamav:1.5.4-debian13-slim` (multi-arch digest; the bare `1.5.4` tag is amd64-only) | the antivirus daemon | `clamdscan --ping` |
 | `storage` (+ `storage-init`) | `${REGISTRY}/trades/minio@sha256:…` / `…/mc@sha256:…` (ADR-126) | the object store (synthetic media only in stage 1); public endpoint `storage.{domain}` | `/minio/health/live`; `storage-init` exited 0 |
 | `mailpit` | `axllent/mailpit:v1.31.2` | stage-1 mail capture: every message the platform sends, nothing leaves the host; viewer at `mail.{domain}` behind basic auth; bounded 500 messages / 14 days | `mailpit readyz` |
 | `postgres` | `imresamu/postgis:18-3.6` | one instance: `trades_app` (one schema per bundle) + `media` | `pg_isready` |
@@ -275,6 +275,18 @@ host, then re-run), keeps `/srv/trades/deploy.bak-<ts>`, transfers the committed
 every host hash equals the source commit and records it in `/srv/trades/deploy/.synced-commit`.
 `deploy/.env` and `secrets/` are never touched. The sync restarts nothing: apply the matching
 Caddy lane above afterwards, or promote.
+
+**A pinned third-party image bump** (`clamav`, and any other `image: …@sha256:` that no
+`promote.sh` lane rebuilds) is NOT applied by the sync either — the host keeps the old image until
+the service is recreated, and the next `promote media` would otherwise recreate `clamav`
+implicitly and ungated (`depends_on: service_started`). Apply it explicitly right after the sync:
+
+```bash
+docker compose -f docker-compose.prod.yml pull clamav
+docker compose -f docker-compose.prod.yml up -d clamav    # the clamav-db volume keeps the signatures
+docker compose -f docker-compose.prod.yml exec clamav clamdscan --ping 1   # gate: PONG, then `ps` shows healthy
+docker compose -f docker-compose.prod.yml exec clamav clamd --version     # the pinned version
+```
 
 ## Feature flags — a flip is a RECREATE, never a restart
 

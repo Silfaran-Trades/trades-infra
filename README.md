@@ -11,7 +11,7 @@ following the `ai-standards` infra-repo convention (see
   - `imresamu/postgis:18-3.6` (`trades-postgres`) — `trades_app` for the modular-monolith
     backend (one schema per bundle) plus `media` for media-service
   - `axllent/mailpit` (`trades-mailpit`) — dev SMTP capture
-  - `clamav/clamav:1.5.2-debian13-slim` (`trades-clamav`) — media-service scan worker
+  - `clamav/clamav:1.5.4-debian13-slim` (`trades-clamav`) — media-service scan worker
   Image versions track `ai-standards/standards/tech-stack.md`. Owned/maintained by
   the DevOps agent.
 - `infra/postgres/init/00-create-databases.sql` — `trades_app` (+ its test database) for the
