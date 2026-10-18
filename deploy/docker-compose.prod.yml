@@ -110,7 +110,7 @@ services:
     <<: *service-defaults
     # Pinned to the 2.11 MINOR the Caddyfile was verified on (roll_interval, ip_mask are
     # version-dependent), plus the digest. On a bump re-run deployment.md § DE-004 checks.
-    image: caddy:2.11@sha256:0c994536bddb66445885237f1a5dcc1916bccea922661c76b4e9fc24061f9b52
+    image: caddy:2.11@sha256:685ae3d7c34d9b5f8caeddc5d14051db7bbd88ff1f5a2fa0c16bd8ca328fb7af
     # The ONLY published ports. The two variables exist for the rehearsal machine (a developer
     # laptop may already hold 80/443); production leaves them at the defaults.
     ports:
@@ -431,7 +431,7 @@ services:
   # hub (`up -d --no-recreate`) and gates it with `app`. Ends at 10.9 (SES with the domain).
   mailpit:
     <<: *service-defaults
-    image: axllent/mailpit:v1.31.2@sha256:74d609a42ec279aa63c6b4622a6fa9b5408d1ad5b1d76a1c4be40a265ce0863d
+    image: axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387
     environment:
       MP_MAX_MESSAGES: "500"
       MP_MAX_AGE: "14d"

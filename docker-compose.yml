@@ -88,7 +88,7 @@ services:
     # Off `latest` and digest-pinned (production-packaging-promotion-lane BR-2): it was the
     # only unpinned image across the four code repositories. Development only — production
     # uses the real mailer (deploy/docker-compose.prod.yml has no mailpit).
-    image: axllent/mailpit:v1.31.2@sha256:74d609a42ec279aa63c6b4622a6fa9b5408d1ad5b1d76a1c4be40a265ce0863d
+    image: axllent/mailpit:v1.31.6@sha256:23fe39e81bde596a918000b3135c0f85dc8bb4c9ea6be274b051143f3e300387
     container_name: trades-mailpit
     # Same reason as postgres above: services send through it, so it returns with them.
     restart: unless-stopped

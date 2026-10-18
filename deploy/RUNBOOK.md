@@ -71,7 +71,7 @@ region         = eu-south-2
 | `media` | `${REGISTRY}/trades/media-service:{MEDIA_TAG}` | media-service HTTP + its `scan-worker` and `process-worker` under supervisord | `GET /api/health` (bucket probe) **and** both workers `RUNNING` |
 | `clamav` | `clamav/clamav:1.5.4-debian13-slim` (multi-arch digest; the bare `1.5.4` tag is amd64-only) | the antivirus daemon | `clamdscan --ping` |
 | `storage` (+ `storage-init`) | `${REGISTRY}/trades/minio@sha256:…` / `…/mc@sha256:…` (ADR-126) | the object store (synthetic media only in stage 1); public endpoint `storage.{domain}` behind the perimeter's storage filter (ADR-135); `storage-init` converges the two buckets AND the two least-privilege users `media-presign` / `media-service` media-service runs as — root stays in `storage.env` only (§ "Object storage identities and the root rotation") | `/minio/health/live`; `storage-init` exited 0 |
-| `mailpit` | `axllent/mailpit:v1.31.2` | stage-1 mail capture: every message the platform sends, nothing leaves the host; viewer at `mail.{domain}` behind basic auth; bounded 500 messages / 14 days | `mailpit readyz` |
+| `mailpit` | `axllent/mailpit:v1.31.6` | stage-1 mail capture: every message the platform sends, nothing leaves the host; viewer at `mail.{domain}` behind basic auth; bounded 500 messages / 14 days | `mailpit readyz` |
 | `postgres` | `imresamu/postgis:18-3.6` | one instance: `trades_app` (one schema per bundle) + `media` | `pg_isready` |
 | `web` | `${REGISTRY}/trades/trades-front:{WEB_TAG}` | the SPA (static, unprivileged nginx) | `GET /` |
 
@@ -133,7 +133,7 @@ The username and the password **hash** live only in the host's `deploy/.env`
 **single-quote it**: Compose interpolates an unquoted `$` and silently corrupts a bcrypt hash.
 
 ```bash
-docker run --rm caddy:2.11@sha256:0c994536bddb66445885237f1a5dcc1916bccea922661c76b4e9fc24061f9b52 caddy hash-password
+docker run --rm caddy:2.11@sha256:685ae3d7c34d9b5f8caeddc5d14051db7bbd88ff1f5a2fa0c16bd8ca328fb7af caddy hash-password
 # deploy/.env:   BASIC_AUTH_HASH='$2a$14$…'
 cd /srv/trades/deploy && docker compose -f docker-compose.prod.yml config 2>&1 | grep -E 'BASIC_AUTH_HASH|variable is not set'
 # EXPECT the full hash (compose's canonical output doubles the $ signs — that display is

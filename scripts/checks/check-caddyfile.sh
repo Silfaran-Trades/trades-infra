@@ -40,7 +40,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 CADDYFILE="${1:-deploy/Caddyfile}"
-CADDY_IMAGE="${CADDY_IMAGE:-caddy:2.11@sha256:0c994536bddb66445885237f1a5dcc1916bccea922661c76b4e9fc24061f9b52}"
+CADDY_IMAGE="${CADDY_IMAGE:-caddy:2.11@sha256:685ae3d7c34d9b5f8caeddc5d14051db7bbd88ff1f5a2fa0c16bd8ca328fb7af}"
 HOSTS="app api media storage mail"
 AUTH_HOSTS="app mail"
 FLOOR_HEADERS="Strict-Transport-Security Content-Security-Policy X-Content-Type-Options Referrer-Policy Cross-Origin-Opener-Policy Cross-Origin-Resource-Policy"
