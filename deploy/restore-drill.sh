@@ -39,7 +39,7 @@ AWS_REGION="${AWS_REGION:-eu-south-2}"
 export AWS_PAGER=""
 [ -z "$BACKUPS_BUCKET" ] || command -v aws >/dev/null 2>&1 || { echo "✗ drill: BACKUPS_BUCKET set but the aws CLI is not installed" >&2; exit 1; }
 # The production image (docker-compose.prod.yml) — same major, same PostGIS.
-PG_IMAGE="${PG_IMAGE:-imresamu/postgis:18-3.6@sha256:b5766ee720aca09c61b9a868abefbf273348a4b90ad4cf146b4f8c9ac85d48e4}"
+PG_IMAGE="${PG_IMAGE:-trades/postgres:18.6-postgis-3.6.4}"
 CONTAINER="${RESTORE_DRILL_CONTAINER:-trades-restore-drill}"
 WORKDIR="$(mktemp -d)"
 
