@@ -460,7 +460,7 @@ services:
     # image development runs) once the operator has pushed it to ECR and pinned the digest ECR
     # reports HERE — `${REGISTRY:?…}/trades/postgres@sha256:…` — RUNBOOK.md § "PostgreSQL image
     # upgrade". Never a tag, never a local build on the host.
-    image: imresamu/postgis:18-3.6@sha256:b5766ee720aca09c61b9a868abefbf273348a4b90ad4cf146b4f8c9ac85d48e4
+    image: ${REGISTRY:?set REGISTRY in deploy/.env}/trades/postgres@sha256:fb0a9be2b41658b26100643554bd553b43aa333128f7048eb1cc2cc0c0eb6399
     env_file:
       - ${TRADES_SECRETS_DIR:-/srv/trades/secrets}/postgres.env   # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
     read_only: true
