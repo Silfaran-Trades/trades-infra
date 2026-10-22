@@ -464,6 +464,7 @@ pilot, then quarterly. Record each drill's output line here:
 | Date | Dump restored | Result |
 |---|---|---|
 | 2026-10-03 | `trades_app-20261003-070229` + `media-20261003-070229`, fetched from the off-host copy on the Mac (operator profile) | OK — every schema read (e.g. `audit.audit_log`=163, `company.companies`=4, `demand.candidacies`=16); first run failed on the `ai_readonly` GRANTs until `--no-privileges` |
+| 2026-10-22 | `trades_app-20261022-045134` + `media-20261022-045134` (the backup gate of the PostgreSQL 18.6 upgrade), off-host copy, restored into `trades/postgres:18.6-postgis-3.6.4` | OK — all 17 schemas read (e.g. `audit.audit_log`=300, `company.companies`=4, `demand.candidacies`=16); `media.public.media_asset_variants`=156 |
 
 ## PostgreSQL image upgrade — the own image (PostgreSQL 18.6 + PostGIS 3.6.4)
 
@@ -499,16 +500,15 @@ volume; full suites green). Production, in order — each step is the operator's
    ```bash
    $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "SELECT version()"'                       # 18.6
    # collation check — EXPECT no rows (same glibc 2.41); a row means REINDEX that database first
-   $P 'psql -U "$POSTGRES_USER" -d postgres -Atc "SELECT datname FROM pg_database WHERE datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid) AND datname <> '"'"'template0'"'"'"'
-   # production was initialised on imresamu, whose init script ALSO created `template_postgis` and
-   # installed postgis_topology / fuzzystrmatch / postgis_tiger_geocoder in it and in trades_app —
-   # dev never had them. Upgrade EVERY PostGIS extension, in both databases, with PostGIS's own
-   # function (run it again if its output says so), then read the versions back: all 3.6.4.
-   for db in trades_app template_postgis; do
-     $P "psql -U \"\$POSTGRES_USER\" -d $db -Atc \"SELECT extname, extversion FROM pg_extension ORDER BY 1\""
-     $P "psql -U \"\$POSTGRES_USER\" -d $db -Atc \"SELECT postgis_extensions_upgrade()\""
-     $P "psql -U \"\$POSTGRES_USER\" -d $db -Atc \"SELECT extname, extversion FROM pg_extension ORDER BY 1\""
-   done
+   # (NOT datistemplate, not `datname <> 'template0'`: the nested quotes break over SSM)
+   $P 'psql -U "$POSTGRES_USER" -d postgres -Atc "SELECT datname FROM pg_database WHERE NOT datistemplate AND datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)"'
+   # Upgrade EVERY PostGIS extension in trades_app with PostGIS's own function (run it again if its
+   # output says so), then read the versions back: all 3.6.4. Stage 1 has NO `template_postgis`
+   # database (checked 2026-10-22 — the imresamu init script did not leave one); if a rebuilt host
+   # lists one in pg_database, run the same three lines against it too.
+   $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "SELECT extname, extversion FROM pg_extension ORDER BY 1"'
+   $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "SELECT postgis_extensions_upgrade()"'
+   $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "SELECT extname, extversion FROM pg_extension ORDER BY 1"'
    $P 'psql -U "$POSTGRES_USER" -d trades_app -Atc "SELECT postgis_full_version()"'   # POSTGIS="3.6.4 …", no "need upgrade"
    $P 'psql -U "$POSTGRES_USER" -d trades_app -c ANALYZE'
    $P 'psql -U "$POSTGRES_USER" -d media -c ANALYZE'
@@ -649,6 +649,7 @@ replacement of the dataset take the same path. Used on 2026-10-04 to load the pa
 |---|---|
 | 2026-10-03 | first load (Phase 7 step 10): 24 users, then the owner's `platform_admin`; a second run refused (`identity.users already holds 24 row(s)`) |
 | 2026-10-04 | reload with the partner's taxonomy (pending-items-log B-40): 24 users, 20 trades, 83 microskills, 11 demands; 76 mask views; 40 DLQ messages of the known classes drained |
+| 2026-10-22 | reload for the 2026-10-18 upgrade wave + R2 + country/region: 27 users, 20 trades, 83 microskills, 6 companies, 19 demands; 77 mask views; 70 DLQ messages of the known classes drained. Ran twice: the first staging copied the whole `operator/*` value (a sentence) as the password — stage only the part after `password: ` |
 
 At 10.9 the synthetic data is wiped by a documented, evidenced step and this lane is deleted.
 
